@@ -192,6 +192,7 @@ export interface PackageComponent {
   quantity: number;
   allocationPercentage: number; // 0 to 100, must total 100%
   unitPrice: number;
+  isActive?: boolean; // Canonical active status
 }
 
 export interface PackageItem {

@@ -35,6 +35,8 @@ import {
   systemRoutes,
 } from './modules/settings/settings.routes.js';
 import deviceRoutes from './modules/devices/device.routes.js';
+import platformRoutes from './modules/platform/platform.routes.js';
+import billingRoutes from './modules/billing/billing.routes.js';
 
 const router = Router();
 
@@ -92,5 +94,9 @@ router.use('/reports',            reportRoutes);          // Step 20–21
 router.use('/audit-events',       auditRoutes);           // Step 22
 router.use('/ledger',             ledgerRoutes);          // Step 22
 router.use('/devices',            deviceRoutes);          // Step 23 Hardware Integration
+
+// ── SaaS Multi-Tenant Platform & Billing Routes ─────────────────────────────
+router.use('/platform',           platformRoutes);        // Portal 1 SaaS Master Admin Control Plane
+router.use('/tenant/billing',     billingRoutes);         // Portal 2 Salon Owner Billing & Subscription
 
 export default router;

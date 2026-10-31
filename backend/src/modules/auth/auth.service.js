@@ -21,12 +21,28 @@ const PORTAL_NAMES = {
 
 // ── Token helpers ────────────────────────────────────────────────────────────
 
-const signAccessToken = (user) =>
-  jwt.sign(
-    { sub: user.id, role: user.role, branchId: user.branchId, staffId: user.staffId },
+const signAccessToken = (user) => {
+  const primaryMembership = user.tenantMemberships?.[0] || null;
+  const tenant = primaryMembership?.tenant || null;
+  const subscription = tenant?.subscriptions?.[0] || null;
+  const planVersion = subscription?.planVersion || null;
+
+  return jwt.sign(
+    {
+      sub: user.id,
+      role: user.role,
+      branchId: user.branchId,
+      staffId: user.staffId,
+      tenantId: primaryMembership?.tenantId || user.branch?.tenantId || null,
+      tenantRole: primaryMembership?.role || (user.role === 'SUPER_ADMIN' ? 'TENANT_OWNER' : 'STAFF'),
+      tenantSlug: tenant?.slug || null,
+      tenantStatus: tenant?.status || null,
+      allowedModules: planVersion?.allowedModules || null,
+    },
     env.jwtAccessSecret,
     { expiresIn: env.jwtAccessExpires }
   );
+};
 
 // jti makes every refresh token unique even when two are issued in the same second.
 const signRefreshToken = (userId) =>
@@ -43,7 +59,28 @@ export const REFRESH_COOKIE_OPTIONS = {
   path:     '/',
 };
 
-const userInclude = { branch: { select: { name: true, isActive: true } }, staff: true };
+const userInclude = {
+  branch: { select: { id: true, name: true, isActive: true, tenantId: true } },
+  staff: true,
+  tenantMemberships: {
+    include: {
+      tenant: {
+        include: {
+          subscriptions: {
+            where: { status: { in: ['ACTIVE', 'TRIALING', 'PAST_DUE', 'SUSPENDED'] } },
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            include: {
+              planVersion: {
+                include: { plan: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
 
 /**
  * Shared session-eligibility rules (used by login, refresh and every authenticated request).

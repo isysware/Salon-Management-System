@@ -16,6 +16,37 @@ datasource db {
 // ENUMS
 // ═══════════════════════════════════════════════════════════════════
 
+
+enum TenantStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+}
+
+enum SubscriptionStatus {
+  PENDING
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentProofStatus {
+  PENDING_VERIFICATION
+  VERIFIED
+  REJECTED
+}
+
+enum TenantRole {
+  TENANT_OWNER
+  TENANT_ADMIN
+  STAFF
+}
+
 enum Role {
   SUPER_ADMIN
   ADMIN
@@ -341,6 +372,158 @@ enum DeviceStatus {
 // STEP 0 — Base/Shared Models
 // ═══════════════════════════════════════════════════════════════════
 
+
+// ═══════════════════════════════════════════════════════════════════
+// STEP 0.1 — SaaS Core Models (Platform & Multi-Tenancy)
+// ═══════════════════════════════════════════════════════════════════
+
+model Tenant {
+  id              String             @id @default(uuid())
+  name            String
+  slug            String             @unique
+  logoUrl         String?            @db.Text
+  status          TenantStatus       @default(TRIAL)
+  currency        String             @default("PKR")
+  timezone        String             @default("Asia/Karachi")
+  contactEmail    String?
+  contactPhone    String?
+  gracePeriodDays Int                @default(7)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  memberships     TenantMembership[]
+  subscriptions   Subscription[]
+  payments        SubscriptionPayment[]
+  branches        Branch[]
+  auditEvents     TenantAuditEvent[]
+
+  @@map("Tenant")
+}
+
+model TenantMembership {
+  id        String     @id @default(uuid())
+  tenantId  String
+  userId    String
+  role      TenantRole @default(STAFF)
+  status    String     @default("ACTIVE")
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([tenantId])
+  @@index([userId])
+  @@map("TenantMembership")
+}
+
+model Plan {
+  id          String        @id @default(uuid())
+  code        String        @unique
+  name        String
+  description String?
+  isPublic    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  versions    PlanVersion[]
+
+  @@map("Plan")
+}
+
+model PlanVersion {
+  id             String         @id @default(uuid())
+  planId         String
+  versionNumber  Int            @default(1)
+  currency       String         @default("PKR")
+  monthlyPrice   Decimal        @default(0) @db.Decimal(14, 2)
+  annualPrice    Decimal        @default(0) @db.Decimal(14, 2)
+  maxBranches    Int            @default(1)
+  maxStaff       Int            @default(10)
+  maxDevices     Int            @default(1)
+  hasBiometrics  Boolean        @default(false)
+  hasPayroll     Boolean        @default(true)
+  hasCustomSms   Boolean        @default(false)
+  hasInventory   Boolean        @default(true)
+  hasBookings    Boolean        @default(true)
+  allowedModules Json?
+  isActive       Boolean        @default(true)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  plan           Plan           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  subscriptions  Subscription[]
+
+  @@unique([planId, versionNumber])
+  @@map("PlanVersion")
+}
+
+model Subscription {
+  id                 String             @id @default(uuid())
+  tenantId           String
+  planVersionId      String
+  status             SubscriptionStatus @default(TRIALING)
+  billingCycle       String             @default("MONTHLY")
+  currentPeriodStart DateTime           @default(now())
+  currentPeriodEnd   DateTime
+  graceUntil         DateTime?
+  autoRenew          Boolean            @default(true)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  planVersion        PlanVersion        @relation(fields: [planVersionId], references: [id])
+  payments           SubscriptionPayment[]
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("Subscription")
+}
+
+model SubscriptionPayment {
+  id                String             @id @default(uuid())
+  tenantId          String
+  subscriptionId    String
+  amount            Decimal            @db.Decimal(14, 2)
+  currency          String             @default("PKR")
+  paymentMethod     String
+  transactionRef    String?
+  slipAttachmentUrl String?            @db.Text
+  status            PaymentProofStatus @default(PENDING_VERIFICATION)
+  verifiedByUserId  String?
+  verifiedAt        DateTime?
+  rejectionReason   String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscription      Subscription       @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([subscriptionId])
+  @@index([status])
+  @@map("SubscriptionPayment")
+}
+
+model TenantAuditEvent {
+  id        String   @id @default(uuid())
+  tenantId  String
+  actorId   String
+  actorRole String
+  action    String
+  entity    String
+  entityId  String?
+  details   Json?
+  createdAt DateTime @default(now())
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([createdAt])
+  @@map("TenantAuditEvent")
+}
+
 model Sequence {
   id         String @id @default(uuid())
   branchCode String
@@ -348,6 +531,9 @@ model Sequence {
   year       Int
   lastValue  Int    @default(0)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchCode, prefix, year])
   @@map("Sequence")
 }
@@ -376,6 +562,9 @@ model AuditEvent {
   after     Json?
   createdAt DateTime @default(now())
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@index([userId])
   @@index([entity, entityId])
@@ -416,6 +605,7 @@ model User {
   staff         Staff?               @relation(fields: [staffId], references: [id])
   refreshTokens RefreshToken[]
   resetTokens   PasswordResetToken[]
+  tenantMemberships TenantMembership[]
 
   @@index([role])
   @@index([branchId])
@@ -483,7 +673,10 @@ model Branch {
   paymentAccts PaymentAccount[]
   staff        Staff[]
   devices      Device[]
+  tenantId     String?
+  tenant       Tenant?  @relation(fields: [tenantId], references: [id])
 
+  @@index([tenantId])
   @@map("Branch")
 }
 
@@ -505,6 +698,9 @@ model TaxRule {
 
   branch Branch @relation(fields: [branchId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("TaxRule")
 }
@@ -527,6 +723,9 @@ model PaymentAccount {
   branch           Branch            @relation(fields: [branchId], references: [id])
   accountMovements AccountMovement[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("PaymentAccount")
 }
@@ -540,6 +739,9 @@ model ExpenseCategory {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, name])
   @@index([branchId])
   @@map("ExpenseCategory")
@@ -557,6 +759,9 @@ model PayrollPolicy {
   updatedByUserId                String
   updatedAt                      DateTime        @updatedAt
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@map("PayrollPolicy")
 }
 
@@ -604,6 +809,9 @@ model Staff {
   user                User?
   compensationHistory StaffCompensationHistory[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, employeeCode])
   @@index([branchId])
   @@map("Staff")
@@ -619,6 +827,9 @@ model StaffCompensationHistory {
 
   staff Staff @relation(fields: [staffId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([staffId])
   @@map("StaffCompensationHistory")
 }
@@ -634,6 +845,9 @@ model ServiceCategory {
   isActive Boolean   @default(true)
   services Service[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, name])
   @@index([branchId])
   @@map("ServiceCategory")
@@ -657,6 +871,9 @@ model Service {
   category   ServiceCategory    @relation(fields: [categoryId], references: [id])
   components PackageComponent[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, code])
   @@index([branchId])
   @@map("Service")
@@ -677,6 +894,9 @@ model Package {
 
   components PackageComponent[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, code])
   @@index([branchId])
   @@map("Package")
@@ -693,6 +913,9 @@ model PackageComponent {
   package Package @relation(fields: [packageId], references: [id], onDelete: Cascade)
   service Service @relation(fields: [serviceId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([packageId])
   @@map("PackageComponent")
 }
@@ -716,6 +939,9 @@ model Client {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, phoneNormalized])
   @@index([branchId])
   @@map("Client")
@@ -764,6 +990,9 @@ model Appointment {
   items       AppointmentItem[]
   reschedules AppointmentReschedule[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, date])
   @@index([branchId, status])
   @@index([clientId])
@@ -789,6 +1018,9 @@ model AppointmentItem {
   appointment Appointment                   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
   components  AppointmentPackageComponent[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([appointmentId])
   @@index([staffId])
   @@map("AppointmentItem")
@@ -811,6 +1043,9 @@ model AppointmentPackageComponent {
 
   appointmentItem AppointmentItem @relation(fields: [appointmentItemId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([appointmentItemId])
   @@index([staffId])
   @@map("AppointmentPackageComponent")
@@ -832,6 +1067,9 @@ model AppointmentReschedule {
 
   appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([appointmentId])
   @@map("AppointmentReschedule")
 }
@@ -866,6 +1104,9 @@ model CashDrawer {
   movements   DrawerMovement[]
   settlements Settlement[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, kind])
   @@index([custodianUserId, status])
   @@map("CashDrawer")
@@ -888,6 +1129,9 @@ model DrawerMovement {
 
   drawer CashDrawer @relation(fields: [drawerId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([drawerId, createdAt])
   @@index([branchId, createdAt])
   @@index([sourceModule, sourceId])
@@ -911,6 +1155,9 @@ model AccountMovement {
 
   account PaymentAccount @relation(fields: [accountId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([accountId, createdAt])
   @@index([branchId, createdAt])
   @@index([sourceModule, sourceId])
@@ -932,6 +1179,9 @@ model CashTransfer {
   transferredByName   String
   createdAt           DateTime @default(now())
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("CashTransfer")
 }
@@ -986,6 +1236,9 @@ model InventoryItem {
   batches   InventoryBatch[]
   movements StockMovement[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@map("InventoryItem")
 }
 
@@ -1012,6 +1265,9 @@ model InventoryBatch {
   item      InventoryItem   @relation(fields: [itemId], references: [id])
   movements StockMovement[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([itemId, branchId])
   @@index([branchId, expiryDate])
   @@map("InventoryBatch")
@@ -1040,6 +1296,9 @@ model StockMovement {
   item  InventoryItem   @relation(fields: [itemId], references: [id])
   batch InventoryBatch? @relation(fields: [batchId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, createdAt])
   @@index([itemId, branchId])
   @@index([sourceReferenceType, sourceReferenceId])
@@ -1070,6 +1329,9 @@ model Supplier {
   payments  SupplierPayment[]
   returns   SupplierReturn[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("Supplier")
 }
@@ -1093,6 +1355,9 @@ model SupplierLedger {
 
   supplier Supplier @relation(fields: [supplierId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([supplierId, createdAt])
   @@index([branchId])
   @@map("SupplierLedger")
@@ -1124,6 +1389,9 @@ model Purchase {
   supplier Supplier       @relation(fields: [supplierId], references: [id])
   lines    PurchaseLine[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, purchaseDate])
   @@map("Purchase")
 }
@@ -1147,6 +1415,9 @@ model PurchaseLine {
 
   purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([purchaseId])
   @@map("PurchaseLine")
 }
@@ -1175,6 +1446,9 @@ model SupplierPayment {
 
   supplier Supplier @relation(fields: [supplierId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([supplierId])
   @@index([branchId])
   @@map("SupplierPayment")
@@ -1201,6 +1475,9 @@ model SupplierReturn {
   supplier Supplier             @relation(fields: [supplierId], references: [id])
   lines    SupplierReturnLine[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("SupplierReturn")
 }
@@ -1219,6 +1496,9 @@ model SupplierReturnLine {
 
   return SupplierReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([returnId])
   @@map("SupplierReturnLine")
 }
@@ -1239,6 +1519,9 @@ model StockSettlement {
 
   lines StockSettlementLine[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("StockSettlement")
 }
@@ -1261,6 +1544,9 @@ model StockSettlementLine {
 
   settlement StockSettlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([settlementId])
   @@map("StockSettlementLine")
 }
@@ -1311,6 +1597,9 @@ model Invoice {
   payments InvoicePayment[]
   refunds  InvoiceRefund[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, date])
   @@index([clientId])
   @@index([branchId, status])
@@ -1343,6 +1632,9 @@ model InvoiceLine {
   components InvoiceLineComponent[]
   batches    InvoiceLineBatch[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([invoiceId])
   @@index([staffId])
   @@map("InvoiceLine")
@@ -1364,6 +1656,9 @@ model InvoiceLineComponent {
 
   line InvoiceLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([lineId])
   @@index([staffId])
   @@map("InvoiceLineComponent")
@@ -1380,6 +1675,9 @@ model InvoiceLineBatch {
 
   line InvoiceLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([lineId])
   @@map("InvoiceLineBatch")
 }
@@ -1415,6 +1713,9 @@ model InvoicePayment {
 
   invoice Invoice @relation(fields: [invoiceId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([invoiceId])
   @@index([branchId, date])
   @@map("InvoicePayment")
@@ -1437,6 +1738,9 @@ model CommissionEvent {
   consumedByRunId String?
   createdAt       DateTime            @default(now())
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, staffId, eventDate])
   @@index([invoiceId])
   @@map("CommissionEvent")
@@ -1464,6 +1768,9 @@ model InvoiceRefund {
   invoice Invoice      @relation(fields: [invoiceId], references: [id])
   lines   RefundLine[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([invoiceId])
   @@map("InvoiceRefund")
 }
@@ -1479,6 +1786,9 @@ model RefundLine {
 
   refund InvoiceRefund @relation(fields: [refundId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([refundId])
   @@map("RefundLine")
 }
@@ -1523,6 +1833,9 @@ model Expense {
   createdAt                DateTime      @default(now())
   updatedAt                DateTime      @updatedAt
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, expenseDate])
   @@index([branchId, status])
   @@map("Expense")
@@ -1565,6 +1878,9 @@ model Settlement {
 
   drawer CashDrawer @relation(fields: [drawerId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, status])
   @@index([drawerId])
   @@map("Settlement")
@@ -1584,6 +1900,9 @@ model CashVarianceAdjustment {
   approvedByName   String
   createdAt        DateTime @default(now())
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([settlementId])
   @@map("CashVarianceAdjustment")
 }
@@ -1620,6 +1939,9 @@ model AttendanceRecord {
   punches     AttendancePunch[]
   corrections AttendanceCorrection[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([staffId, workDate])
   @@index([branchId, workDate])
   @@map("AttendanceRecord")
@@ -1636,6 +1958,9 @@ model AttendancePunch {
 
   record AttendanceRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([recordId])
   @@map("AttendancePunch")
 }
@@ -1652,6 +1977,9 @@ model AttendanceCorrection {
 
   record AttendanceRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([recordId])
   @@map("AttendanceCorrection")
 }
@@ -1675,6 +2003,9 @@ model LeaveRecord {
   cancelledByName    String?
   cancellationReason String?
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, staffId])
   @@map("LeaveRecord")
 }
@@ -1688,6 +2019,9 @@ model BranchHoliday {
   date     DateTime @db.Date
   title    String
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([branchId, date])
   @@index([branchId])
   @@map("BranchHoliday")
@@ -1727,6 +2061,9 @@ model OvertimeRecord {
   cancellationReason String?
   payrollRunId       String?
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, staffId])
   @@index([branchId, workDate])
   @@map("OvertimeRecord")
@@ -1760,6 +2097,9 @@ model PayrollRun {
   payslips Payslip[]
   payments PayrollPayment[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, month])
   @@map("PayrollRun")
 }
@@ -1777,6 +2117,9 @@ model Payslip {
   payments PayrollPayment[]
   commissionStatements CommissionStatement[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([runId, staffId])
   @@index([staffId])
   @@map("Payslip")
@@ -1812,6 +2155,9 @@ model PayrollPayment {
   payslip Payslip    @relation(fields: [payslipId], references: [id])
   commissionPayments CommissionPayment[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([runId])
   @@index([staffId])
   @@map("PayrollPayment")
@@ -1830,6 +2176,9 @@ model StaffAllowance {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([staffId])
   @@map("StaffAllowance")
 }
@@ -1854,6 +2203,9 @@ model PayrollAdjustment {
   cancelledByUserId String?
   cancelledByName   String?
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, month])
   @@index([staffId])
   @@map("PayrollAdjustment")
@@ -1887,6 +2239,9 @@ model SalaryAdvance {
 
   recoveries AdvanceRecovery[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, staffId])
   @@map("SalaryAdvance")
 }
@@ -1904,6 +2259,9 @@ model AdvanceRecovery {
 
   advance SalaryAdvance @relation(fields: [advanceId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([advanceId])
   @@index([payrollRunId])
   @@map("AdvanceRecovery")
@@ -1931,6 +2289,9 @@ model CommissionRun {
   statements CommissionStatement[]
   payments   CommissionPayment[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@map("CommissionRun")
 }
@@ -1948,6 +2309,9 @@ model CommissionStatement {
   run      CommissionRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
   payments CommissionPayment[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([runId, staffId])
   @@index([staffId])
   @@map("CommissionStatement")
@@ -1983,6 +2347,9 @@ model CommissionPayment {
   statement CommissionStatement @relation(fields: [statementId], references: [id])
   payrollPayment PayrollPayment? @relation(fields: [payrollPaymentId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([runId])
   @@index([staffId])
   @@map("CommissionPayment")
@@ -2027,6 +2394,9 @@ model TipReceipt {
 
   allocations TipAllocation[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, collectionDate])
   @@index([invoiceId])
   @@map("TipReceipt")
@@ -2059,6 +2429,9 @@ model TipAllocation {
   receipt TipReceipt  @relation(fields: [receiptId], references: [id])
   payouts TipPayout[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([receiptId])
   @@index([staffId])
   @@index([branchId, allocationDate])
@@ -2094,6 +2467,9 @@ model TipPayout {
 
   allocation TipAllocation @relation(fields: [allocationId], references: [id])
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([staffId])
   @@index([branchId, payoutDate])
   @@map("TipPayout")
@@ -2129,6 +2505,9 @@ model Device {
   branch Branch      @relation(fields: [branchId], references: [id])
   logs   DeviceLog[]
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId])
   @@index([deviceType])
   @@index([status])
@@ -2147,6 +2526,9 @@ model DeviceLog {
 
   device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([deviceId])
   @@index([branchId, createdAt])
   @@map("DeviceLog")
@@ -2202,6 +2584,9 @@ model Booking {
   history             BookingHistory[]
   invoice             Invoice?
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([branchId, eventDate])
   @@index([branchId, status])
   @@index([clientId])
@@ -2229,6 +2614,9 @@ model BookingItem {
   endTime         String
   components      Json @default("[]")
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@unique([bookingId, lineInstanceId])
   @@index([bookingId])
   @@index([staffId])
@@ -2255,6 +2643,9 @@ model BookingPayment {
   processedByName    String
   createdAt          DateTime @default(now())
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([bookingId])
   @@index([branchId, date])
 }
@@ -2271,5 +2662,8 @@ model BookingHistory {
   userName   String
   createdAt  DateTime @default(now())
 
+  tenantId  String?
+
+  @@index([tenantId])
   @@index([bookingId, createdAt])
 }

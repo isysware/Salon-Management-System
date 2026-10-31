@@ -50,6 +50,8 @@ export function canAccessRoute(user: User | null, routePath: string): boolean {
       ? '/accounts/account-settlement'
       : path === '/operations/pos'
       ? '/pos'
+      : path === '/settings/billing'
+      ? '/admin/billing'
       : path === '/expenses'
       ? '/accounts/expenses'
       : path === '/admin/tax-settings' || path === '/admin/payment-accounts'

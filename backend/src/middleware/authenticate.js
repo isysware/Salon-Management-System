@@ -25,19 +25,32 @@ export const authenticate = asyncHandler(async (req, _res, next) => {
 
   const user = await prisma.user.findUnique({
     where:   { id: payload.sub },
-    include: { branch: { select: { name: true, isActive: true } }, staff: { select: { name: true, isActive: true, hasPortalAccess: true, branchId: true } } },
+    include: {
+      branch: { select: { id: true, name: true, isActive: true, tenantId: true } },
+      staff: { select: { name: true, isActive: true, hasPortalAccess: true, branchId: true } },
+      tenantMemberships: {
+        include: {
+          tenant: true,
+        },
+      },
+    },
   });
 
   const blocked = sessionBlockReason(user);
   if (blocked) throw new AppError(401, 'USER_INACTIVE', blocked);
 
+  const primaryMembership = user.tenantMemberships?.[0] || null;
+
   req.user = {
-    id:       user.id,
-    name:     user.name,
-    email:    user.email,
-    role:     user.role,
-    branchId: user.branchId,
-    staffId:  user.staffId,
+    id:                user.id,
+    name:              user.name,
+    email:             user.email,
+    role:              user.role,
+    branchId:          user.branchId,
+    staffId:           user.staffId,
+    tenantId:          payload.tenantId || primaryMembership?.tenantId || user.branch?.tenantId || null,
+    tenantRole:        payload.tenantRole || primaryMembership?.role || (user.role === 'SUPER_ADMIN' ? 'TENANT_OWNER' : 'STAFF'),
+    tenantMemberships: user.tenantMemberships || [],
   };
   next();
 });

@@ -514,6 +514,13 @@ export const NAVIGATION_GROUPS: NavGroup[] = [
             href: '/admin/branches',
             allowedRoles: ['SUPER_ADMIN'], // Only Super Admin
           },
+          {
+            id: 'billing-subscription-child',
+            label: 'Plan & Billing Subscription',
+            href: '/admin/billing',
+            allowedRoles: ['SUPER_ADMIN', 'ADMIN'],
+            badge: 'SaaS Plan',
+          },
         ],
       },
       {

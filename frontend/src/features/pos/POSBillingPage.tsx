@@ -572,11 +572,19 @@ export const POSBillingPage: React.FC = () => {
   }, [services]);
 
   // Check if a package contains any deactivated service
-  const getPackageValidity = (pkg: PackageItem) => {
+  const getPackageValidity = (pkg: PackageItem): { isValid: boolean; reason?: string } => {
+    if (!pkg.components || pkg.components.length === 0) {
+      return { isValid: false, reason: `Package '${pkg.name}' has no component services configured.` };
+    }
     for (const comp of pkg.components) {
+      // 1. Check direct component active flag if provided by backend DTO
+      if (comp.isActive === false) {
+        return { isValid: false, reason: `Component service '${comp.serviceName || comp.serviceCode}' is deactivated.` };
+      }
+      // 2. Check loaded active services state if present
       const srv = services.find((s) => s.id === comp.serviceId);
-      if (!srv || !srv.isActive) {
-        return { isValid: false, reason: `Component '${comp.serviceName}' is deactivated` };
+      if (srv && !srv.isActive) {
+        return { isValid: false, reason: `Component service '${comp.serviceName || srv.name}' is deactivated.` };
       }
     }
     return { isValid: true };
@@ -769,7 +777,10 @@ export const POSBillingPage: React.FC = () => {
   // Add Package to Cart
   const handleAddPackageToCart = (pkg: PackageItem) => {
     const validity = getPackageValidity(pkg);
-    if (!validity.isValid) return;
+    if (!validity.isValid) {
+      toast.warning(validity.reason || `Cannot add package '${pkg.name}' to cart.`);
+      return;
+    }
 
     setCart((prev) => {
       const existingIndex = prev.findIndex(

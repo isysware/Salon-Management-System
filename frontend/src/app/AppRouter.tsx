@@ -14,6 +14,7 @@ import { UsersAccessPage } from '../features/users/UsersAccessPage';
 import { StaffDirectoryPage } from '../features/staff/StaffDirectoryPage';
 import { ServicesPackagesPage } from '../features/catalogue/ServicesPackagesPage';
 import { BranchSettingsPage } from '../features/branches/BranchSettingsPage';
+import { BillingPage } from '../features/billing/BillingPage';
 import { DeviceIntegrationPage } from '../features/devices/DeviceIntegrationPage';
 import { POSBillingPage } from '../features/pos/POSBillingPage';
 import { SalesInvoicesPage } from '../features/invoices/SalesInvoicesPage';
@@ -139,6 +140,9 @@ export const AppRouter: React.FC = () => {
     }
     if (pathname === '/admin/devices' || pathname === '/admin/device-settings') {
       return <DeviceIntegrationPage />;
+    }
+    if (pathname === '/admin/billing' || pathname === '/settings/billing') {
+      return <BillingPage />;
     }
     if (pathname === '/admin/attendance-settings') {
       return <AttendanceSettingsPage />;

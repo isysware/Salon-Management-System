@@ -131,8 +131,10 @@ export const findOrCreateClient = async (tx, { branchId, clientId, name, phone, 
     const norm = assertValidPhone(phone);
     client = await tx.client.findUnique({ where: { branchId_phoneNormalized: { branchId, phoneNormalized: norm } } });
     if (!client) {
+      const branch = await tx.branch.findUnique({ where: { id: branchId }, select: { tenantId: true } });
       client = await tx.client.create({
         data: {
+          tenantId: branch?.tenantId || null,
           branchId, name, phone: formatPhoneNumber(phone), phoneNormalized: norm,
           email: email || null, source: source || 'WALK_IN', sourceDetails: sourceDetails || null,
         },
@@ -157,8 +159,11 @@ export const createClient = async (input, actor) => {
     if (existing) {
       throw conflict('CLIENT_EXISTS', `A client with phone number '${input.phone}' already exists: ${existing.name}.`, { clientId: existing.id });
     }
+    const branch = await tx.branch.findUnique({ where: { id: branchId }, select: { tenantId: true } });
+    const tenantId = actor.tenantId || branch?.tenantId || null;
     const c = await tx.client.create({
       data: {
+        tenantId,
         branchId,
         name:            input.name,
         phone:           formatPhoneNumber(input.phone),
@@ -170,7 +175,7 @@ export const createClient = async (input, actor) => {
         notes:           input.notes || null,
       },
     });
-    await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'CLIENT_CREATED', entity: 'Client', entityId: c.id, branchId, after: c });
+    await auditLog(tx, { tenantId, userId: actor.id, userName: actor.name, action: 'CLIENT_CREATED', entity: 'Client', entityId: c.id, branchId, after: c });
     return toClientDTO(c);
   });
 };
