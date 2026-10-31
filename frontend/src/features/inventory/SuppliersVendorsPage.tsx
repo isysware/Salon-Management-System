@@ -1088,7 +1088,7 @@ export const SuppliersVendorsPage: React.FC = () => {
                 <Truck className="w-12 h-12 stroke-[1.25] text-slate-300 mb-3" />
                 <p className="text-slate-800 text-sm font-semibold mb-1">No Suppliers Registered Yet</p>
                 <p className="text-slate-500 text-xs max-w-md mb-4">
-                  There are no vendors registered in Meerub Salon. Register a supplier to start recording stock shipments, purchase bills, and view their single khata ledger statements.
+                  There are no vendors registered in Downtown Flagship. Register a supplier to start recording stock shipments, purchase bills, and view their single khata ledger statements.
                 </p>
                 <button
                   type="button"

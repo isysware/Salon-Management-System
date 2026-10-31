@@ -207,7 +207,7 @@ export const ClientDetailsModal: React.FC<ClientDetailsModalProps> = ({
                     )}
                     <span className="flex items-center gap-1 whitespace-nowrap">
                       <Building2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                      {allBranches?.find((b) => b.id === client.branchId)?.name || 'Meerub Salon'}
+                      {allBranches?.find((b) => b.id === client.branchId)?.name || 'Downtown Flagship'}
                     </span>
                   </div>
 

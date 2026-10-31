@@ -45,7 +45,7 @@ export const BookingConfirmationModal: React.FC<BookingConfirmationModalProps> =
 
   const fullMessageText = useMemo(() => {
     if (!booking) return '';
-    const bName = branch?.name || 'Meerub Salon';
+    const bName = branch?.name || 'Downtown Flagship';
     const bPhone = branch?.phone ? `\nBranch Contact: ${branch.phone}` : '';
     const servicesList = booking.items.map(i => i.name).filter(Boolean).join(', ') || 'Bridal/Groom Services';
     const advance = booking.advancePaid || (booking.payments && booking.payments.length > 0 ? booking.payments.reduce((s, p) => s + (p.isRefund ? -p.amount : p.amount), 0) : 0);
@@ -166,7 +166,7 @@ We look forward to serving you!`;
                   Dear {booking.clientName},
                 </p>
                 <p className="text-slate-600 text-[11px] leading-relaxed">
-                  Your reservation at <strong className="text-slate-900">{branch?.name || 'Meerub Salon'}</strong> is confirmed!
+                  Your reservation at <strong className="text-slate-900">{branch?.name || 'Downtown Flagship'}</strong> is confirmed!
                 </p>
               </div>
 

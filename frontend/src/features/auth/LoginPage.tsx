@@ -127,7 +127,7 @@ export const LoginPage: React.FC = () => {
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-xl font-bold tracking-tight text-white">Meerab Salon</span>
+                <span className="text-xl font-bold tracking-tight text-white">SalonOS Luxury Suite</span>
                 <span className="text-[10px] uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-white/20 font-semibold text-white backdrop-blur-md border border-white/20">
                   SalonOS
                 </span>
@@ -194,7 +194,7 @@ export const LoginPage: React.FC = () => {
 
         {/* Brand Footer */}
         <div className="relative z-10 pt-4 border-t border-white/15 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-[#FCE8EC]/80">
-          <p>© 2026 Meerab Salon Management System. All rights reserved.</p>
+          <p>© 2026 SalonOS SaaS Management System. All rights reserved.</p>
           <p className="font-medium text-white/90">Powered by iSysware Enterprise</p>
         </div>
       </div>

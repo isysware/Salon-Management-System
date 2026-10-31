@@ -169,7 +169,7 @@ export const ClientsPage: React.FC = () => {
     (branchId: string) => {
       if (!branchId || branchId === 'ALL') return 'All Branches';
       const found = branches.find((b) => b.id === branchId) || allBranches?.find((b) => b.id === branchId);
-      return found?.name || 'Meerub Salon';
+      return found?.name || 'Downtown Flagship';
     },
     [branches, allBranches]
   );

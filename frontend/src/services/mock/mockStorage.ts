@@ -42,7 +42,7 @@ import {
 } from '@/types/salon';
 import { User } from '@/types/auth';
 
-const STORAGE_VERSION = 'meerub_salon_store_v1';
+const STORAGE_VERSION = 'salonos_saas_store_v1';
 export const DEFAULT_DEMO_DATE = '2026-10-25';
 
 export interface StorageSchema {
@@ -213,20 +213,20 @@ const INITIAL_TAX_RULES: TaxRule[] = [
 const INITIAL_BRANCHES: Branch[] = [
   {
     id: 'b0000000-0000-0000-0000-000000000001',
-    name: 'Meerub Salon',
-    code: 'MEERUB-01',
+    name: 'Downtown Flagship',
+    code: 'MAIN-01',
     address: 'Main Commercial Area, Karachi',
     city: 'Karachi',
     phone: '+92 (21) 3000-0000',
-    email: 'info@meerubsalon.com',
+    email: 'info@salonos.com',
     timezone: 'Asia/Karachi',
     taxRate: 0,
     taxEnabled: false,
     currency: 'PKR',
     openingCashFloat: 0.0,
     isActive: true,
-    assignedAdminId: 'usr-admin-meerub',
-    assignedAdminName: 'Meerub Admin',
+    assignedAdminId: 'usr-admin-01',
+    assignedAdminName: 'Branch Admin',
   },
 ];
 
@@ -234,7 +234,7 @@ const INITIAL_USERS: User[] = [
   {
     id: 'usr-super-01',
     name: 'Super Administrator',
-    email: 'superadmin@meerubsalon.com',
+    email: 'superadmin@salonos.com',
     role: 'SUPER_ADMIN',
     branchId: 'ALL',
     branchName: 'All Branches (Consolidated)',
@@ -258,12 +258,12 @@ const INITIAL_USERS: User[] = [
     password: 'admin123',
   },
   {
-    id: 'usr-admin-meerub',
-    name: 'Meerub Admin',
-    email: 'admin@meerubsalon.com',
+    id: 'usr-admin-01',
+    name: 'Branch Admin',
+    email: 'admin@salonos.com',
     role: 'ADMIN',
     branchId: 'b0000000-0000-0000-0000-000000000001',
-    branchName: 'Meerub Salon',
+    branchName: 'Downtown Flagship',
     title: 'Branch Manager',
     phone: '+92 (300) 000-0002',
     isActive: true,

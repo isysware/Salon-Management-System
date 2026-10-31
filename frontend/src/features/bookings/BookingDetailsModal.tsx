@@ -162,7 +162,7 @@ export const BookingDetailsModal: React.FC<BookingDetailsModalProps> = ({
               <div className="flex items-center gap-2 text-slate-600">
                 <Building2 className="w-4 h-4 text-[#9D2558]" />
                 <span>
-                  Branch: <strong className="text-slate-900">{branch?.name || 'Meerub Salon'}</strong>
+                  Branch: <strong className="text-slate-900">{branch?.name || 'Downtown Flagship'}</strong>
                 </span>
               </div>
             </div>

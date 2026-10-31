@@ -976,7 +976,7 @@ export const BranchSettingsPage: React.FC = () => {
                     required
                     value={profileName}
                     onChange={(e) => setProfileName(e.target.value)}
-                    placeholder="e.g. Meerub Salon & Spa"
+                    placeholder="e.g. Downtown Flagship & Spa"
                     className="text-xs rounded-xl bg-white/70 border-white/80 focus:border-[#B82E69]"
                   />
                 </div>
@@ -1002,7 +1002,7 @@ export const BranchSettingsPage: React.FC = () => {
                     type="email"
                     value={profileEmail}
                     onChange={(e) => setProfileEmail(e.target.value)}
-                    placeholder="e.g. info@meerubsalon.com"
+                    placeholder="e.g. info@salonos.com"
                     className="text-xs rounded-xl bg-white/70 border-white/80 focus:border-[#B82E69]"
                   />
                 </div>

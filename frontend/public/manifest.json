@@ -1,6 +1,6 @@
 {
-  "name": "Meerub Salon Management System",
-  "short_name": "Meerub Salon",
+  "name": "SalonOS SaaS Management System",
+  "short_name": "SalonOS",
   "description": "Luxury Enterprise Salon Management System",
   "start_url": "/",
   "display": "standalone",
