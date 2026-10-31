@@ -1,0 +1,470 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-inter: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'Inter', sans-serif;
+  --font-serif: 'Inter', sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+@layer base {
+  :root {
+    --background: #faf8f9;
+    --foreground: #23151d;
+    --card: #ffffff;
+    --card-foreground: #23151d;
+    --popover: #ffffff;
+    --popover-foreground: #23151d;
+    --primary: #9d2558;
+    --primary-foreground: #ffffff;
+    --primary-hover: #851c47;
+    --secondary: #fce8ec;
+    --secondary-foreground: #9d2558;
+    --muted: #fdf2f5;
+    --muted-foreground: #78616c;
+    --accent: #fce8ec;
+    --accent-foreground: #9d2558;
+    --destructive: #ef4444;
+    --destructive-foreground: #ffffff;
+    --border: #e2e8f0;
+    --input: #e2e8f0;
+    --ring: #9d2558;
+    --radius: 0.75rem;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  *, ::before, ::after {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  html {
+    scrollbar-gutter: stable;
+    overflow-y: auto;
+  }
+
+  /* Completely disable Radix UI's body scroll-lock margin/padding injection */
+  body[data-scroll-locked],
+  html[data-scroll-locked] {
+    margin-right: 0px !important;
+    margin-left: 0px !important;
+    padding-right: 0px !important;
+    overflow-y: auto !important;
+  }
+
+  html, body {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  button, input, select, textarea {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  /* Prevent duplicate outline / double borders on dropdowns, selects, buttons, and inputs */
+  :is(select, input, textarea, button) {
+    outline: none;
+  }
+
+  :is(select, input, textarea, button):focus,
+  :is(select, input, textarea, button):focus-visible {
+    outline: none !important;
+  }
+
+  /* Accessible focus outline for links and non-input interactive elements */
+  a:focus-visible,
+  [tabindex]:not(select):not(input):not(textarea):not(button):focus-visible {
+    outline: 2px solid #9d2558;
+    outline-offset: 2px;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* Shared record grid for reports, operations, finance and staff workspaces. */
+.report-records {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+
+.report-records > thead > tr > th {
+  background: #FDF2F5;
+  color: #475569;
+  font-weight: 600;
+  white-space: nowrap;
+  border-bottom: 1px solid #cbd5e1;
+}
+
+.report-records > :is(thead, tbody, tfoot) > tr > :is(th, td) {
+  padding: 14px 16px;
+  border-right: 1px solid #e2e8f0;
+  vertical-align: middle;
+  font-size: 13px;
+}
+
+.report-records > :is(thead, tbody, tfoot) > tr > :last-child {
+  border-right: 0;
+}
+
+.report-records > tbody > tr > td {
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.report-records > tbody > tr:nth-child(even) {
+  background-color: #f8fafc;
+}
+
+.report-records > tbody > tr:hover {
+  background-color: #FDF2F5;
+}
+
+.report-records > tbody > tr[data-state='selected'] {
+  background-color: #FCE8EC;
+}
+
+.report-records > tbody > tr > td[colspan] {
+  white-space: normal;
+}
+
+.report-records > tbody > tr > td[colspan]:only-child {
+  padding-block: 32px;
+}
+
+@media (max-width: 640px) {
+  .report-records > :is(thead, tbody, tfoot) > tr > :is(th, td) {
+    padding: 12px;
+  }
+}
+
+.report-records > tfoot > tr > td {
+  background: #f8fafc;
+  border-top: 1px solid #cbd5e1;
+  font-weight: 600;
+}
+
+/* ── THEME-ALIGNED LUXURY LIGHT SCROLLBAR DESIGN ── */
+/* Modern Chromium (Chrome, Edge), Safari & WebKit */
+::-webkit-scrollbar,
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-button,
+*::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+::-webkit-scrollbar-track,
+*::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb,
+*::-webkit-scrollbar-thumb {
+  background: #C4728F; /* Clearly visible, elegant rose */
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background-clip: padding-box;
+  transition: background-color 0.2s ease;
+}
+
+/* Explicit styling for all Select & Dropdown menus to have visible scrollbar */
+[data-radix-select-viewport],
+[data-radix-dropdown-menu-content] {
+  scrollbar-width: thin !important;
+  scrollbar-color: #B82E69 #FCE4EC !important;
+}
+
+[data-radix-select-viewport]::-webkit-scrollbar,
+[data-radix-dropdown-menu-content]::-webkit-scrollbar {
+  width: 5px !important;
+  display: block !important;
+}
+
+[data-radix-select-viewport]::-webkit-scrollbar-track,
+[data-radix-dropdown-menu-content]::-webkit-scrollbar-track {
+  background: #FDF2F5 !important;
+  border-radius: 9999px;
+}
+
+[data-radix-select-viewport]::-webkit-scrollbar-thumb,
+[data-radix-dropdown-menu-content]::-webkit-scrollbar-thumb {
+  background: #B82E69 !important;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:hover {
+  background: #C4728F; /* Elegant medium rose */
+}
+
+::-webkit-scrollbar-thumb:active,
+*::-webkit-scrollbar-thumb:active {
+  background: #9D2558; /* Signature brand berry */
+}
+
+::-webkit-scrollbar-corner,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Fallback for Firefox (only applies where -webkit-scrollbar is not supported) */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #E8BFCD transparent;
+  }
+}
+
+/* POS Cart Dedicated Sleek Visible Scrollbar */
+.pos-cart-scroller {
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+.pos-cart-scroller::-webkit-scrollbar {
+  width: 5px;
+}
+.pos-cart-scroller::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.pos-cart-scroller::-webkit-scrollbar-track {
+  background: rgba(253, 242, 245, 0.7);
+  border-radius: 9999px;
+}
+.pos-cart-scroller::-webkit-scrollbar-thumb {
+  background: #E8BFCD;
+  border-radius: 9999px;
+  transition: background-color 0.2s ease;
+}
+.pos-cart-scroller::-webkit-scrollbar-thumb:hover {
+  background: #C4728F;
+}
+.pos-cart-scroller::-webkit-scrollbar-thumb:active {
+  background: #9D2558;
+}
+
+/* Sidebar Dedicated Sleek Scrollbar */
+.sidebar-scroller {
+  scroll-behavior: smooth;
+}
+.sidebar-scroller::-webkit-scrollbar {
+  width: 3.5px;
+}
+.sidebar-scroller::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.sidebar-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-scroller::-webkit-scrollbar-thumb {
+  background: rgba(157, 37, 88, 0.2);
+  border-radius: 9999px;
+  transition: background-color 0.2s ease;
+}
+.sidebar-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(157, 37, 88, 0.45);
+}
+
+/* POS Category Pills Dedicated Visible Horizontal Scrollbar */
+.pos-category-scroller {
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+.pos-category-scroller::-webkit-scrollbar {
+  height: 4px;
+}
+.pos-category-scroller::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.pos-category-scroller::-webkit-scrollbar-track {
+  background: rgba(253, 242, 245, 0.85);
+  border-radius: 9999px;
+  margin: 0 4px;
+}
+.pos-category-scroller::-webkit-scrollbar-thumb {
+  background: #E8BFCD;
+  border-radius: 9999px;
+  transition: background-color 0.2s ease;
+}
+.pos-category-scroller::-webkit-scrollbar-thumb:hover {
+  background: #C4728F;
+}
+.pos-category-scroller::-webkit-scrollbar-thumb:active {
+  background: #9D2558;
+}
+
+/* Scrollbar None Utilities */
+.scrollbar-none,
+.no-scrollbar {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+.scrollbar-none::-webkit-scrollbar,
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+  .receipt-print-area, .receipt-print-area * {
+    visibility: visible !important;
+  }
+  .receipt-print-area {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 12px !important;
+    border: none !important;
+    box-shadow: none !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+  }
+}
+
+/* Simple circular berry rounded-border loaders */
+.spinner-blue,
+.spinner-primary,
+.spinner-berry {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 9999px;
+  border: 2.5px solid #fce8ec;
+  border-top-color: #9d2558;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.spinner-blue-sm,
+.spinner-primary-sm,
+.spinner-berry-sm {
+  width: 1rem;
+  height: 1rem;
+  border-radius: 9999px;
+  border: 2px solid #fce8ec;
+  border-top-color: #9d2558;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.spinner-blue-lg,
+.spinner-primary-lg,
+.spinner-berry-lg {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 9999px;
+  border: 3px solid #fce8ec;
+  border-top-color: #9d2558;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* Custom Elegant Select Dropdown Styling */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239D2558' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  background-size: 1rem 1rem;
+  padding-right: 2.25rem !important;
+  cursor: pointer;
+}
+
+/* Premium Glassmorphic & Shadcn Card Utilities */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+
+.glass-pill {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+}
+
+.progress-striped-emerald {
+  background-color: #10b981;
+  background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.28) 6px, transparent 6px, transparent 12px);
+}
+
+.progress-striped-sky {
+  background-color: #0284c7;
+  background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.28) 6px, transparent 6px, transparent 12px);
+}
+
+.progress-striped-rose {
+  background-color: #f43f5e;
+  background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.28) 6px, transparent 6px, transparent 12px);
+}
+
+.progress-striped-primary {
+  background-color: #9d2558;
+  background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.28) 6px, transparent 6px, transparent 12px);
+}
+
+
+
+

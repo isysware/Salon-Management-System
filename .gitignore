@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+*/node_modules/
+**/node_modules/
+.pnp
+.pnp.js
+
+# Production build outputs
+dist/
+**/dist/
+build/
+**/build/
+.vercel
+
+# Environment variables
+.env
+.env.*
+.env*
+!.env.example
+**/.env
+**/.env.*
+**/.env*
+!**/.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+**/*.log
+
+# Test & artifacts
+test-artifacts/
+**/test-artifacts/
+coverage/
+**/coverage/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Deployment packages & archives
+deployment-builds/
+*.zip
+*.tar.gz
+*.sqlite
+*.sqlite3
+*.db

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="brand-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C43872" />
+      <stop offset="50%" stop-color="#B82E69" />
+      <stop offset="100%" stop-color="#9D2558" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded Brand Squircle Background -->
+  <rect x="6" y="6" width="116" height="116" rx="30" fill="url(#brand-grad)" />
+
+  <!-- Subtle Inner Border Highlight -->
+  <rect x="7" y="7" width="114" height="114" rx="29" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="2" />
+
+  <!-- Crisp Salon Scissors Icon (Rotated -45deg, matching app sidebar/header logo) -->
+  <g transform="translate(64, 64) rotate(-45) scale(3.5) translate(-12, -12)" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="6" cy="6" r="3" />
+    <path d="M8.12 8.12 12 12" />
+    <path d="M20 4 8.12 15.88" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M14.8 14.8 20 20" />
+  </g>
+</svg>

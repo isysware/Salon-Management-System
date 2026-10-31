@@ -1,0 +1,40 @@
+{
+  "checkedAt": "2026-10-25T17:54:01.734Z",
+  "readOnly": true,
+  "mockMode": false,
+  "counts": {
+    "bookings": 4,
+    "clients": 4,
+    "items": 4,
+    "receipts": 4,
+    "refunds": 0,
+    "linkedInvoices": 3,
+    "cashMovements": 4,
+    "accountMovements": 0,
+    "clientLedgersChecked": 4
+  },
+  "totals": {
+    "bookingNetReceipts": 14000,
+    "cashAdvanceNet": 14000,
+    "onlineAdvanceNet": 0,
+    "reportBookingCashFlow": 14000
+  },
+  "api": {
+    "bookings": 4,
+    "receipts": 4,
+    "bookingSalesReportRows": 3,
+    "status": "passed"
+  },
+  "issues": [],
+  "browser": {
+    "realApi": true,
+    "mockedData": false,
+    "writesBlocked": true,
+    "clientLedgers": 4,
+    "errors": [],
+    "reportBookingReceipts": 4,
+    "reportDisplayedBookingCashFlow": 14000,
+    "status": "passed"
+  },
+  "status": "passed"
+}

@@ -1,0 +1,15 @@
+import { asyncHandler } from '../../lib/asyncHandler.js';
+import { postingRequest } from '../../lib/paymentPosting.js';
+import * as s from './bookings.service.js';
+const send = (fn, status = 200) => asyncHandler(async (req, res) => res.status(status).json({ data: await fn(req) }));
+export const list = send(r => s.listBookings(r.user, r.query));
+export const collections = send(r => s.getCollections(r.user, r.query));
+export const get = send(r => s.getBooking(r.user, r.params.id));
+export const create = send(r => s.createBooking(r.body, r.user, postingRequest(r)), 201);
+export const update = send(r => s.updateBooking(r.params.id, r.body, r.user));
+export const status = send(r => s.updateStatus(r.params.id, r.body, r.user));
+export const payment = send(r => s.recordPayment(r.params.id, r.body, r.user, postingRequest(r)), 201);
+export const refund = send(r => s.refundPayment(r.params.id, r.body, r.user, postingRequest(r)), 201);
+export const cancel = send(r => s.cancelBooking(r.params.id, r.body, r.user, postingRequest(r)));
+export const ledger = send(r => s.getLedger(r.user, r.params.id));
+export const handoff = send(r => s.getHandoff(r.user, r.params.id));
