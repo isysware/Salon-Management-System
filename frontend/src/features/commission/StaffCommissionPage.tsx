@@ -30,8 +30,12 @@ import {
   Lock,
   Layers,
   Sparkles,
+  Banknote,
+  Building2,
+  Loader2,
 } from 'lucide-react';
 import { roundCurrency } from '../../lib/taxCalculations';
+import { isCompensationEligibleForCommission } from '../../lib/commissionCalculations';
 import { AccessDeniedView } from '../scaffold/AccessDeniedView';
 import { toast } from '../../context/ToastContext';
 import { BranchActionField } from '@/components/BranchActionField';
@@ -57,12 +61,18 @@ export const StaffCommissionPage: React.FC = () => {
   const [onlineAccounts, setOnlineAccounts] = useState<OnlineAccount[]>([]);
   const [cashDrawers, setCashDrawers] = useState<CashDrawer[]>([]);
 
-  // Filters
+  // Filters & Generation Controls
   const [selectedBranchId, setSelectedBranchId] = useState<string>(
     user.role === 'SUPER_ADMIN' ? (activeBranchId === 'ALL' ? (allBranches[0]?.id || '') : activeBranchId) : (user.branchId || '')
   );
+  const [periodType, setPeriodType] = useState<'MONTHLY' | 'DAILY' | 'CUSTOM'>('MONTHLY');
+  const currentMonthStr = todayStr.slice(0, 7);
+  const [selectedMonth, setSelectedMonth] = useState<string>(currentMonthStr);
+  const [selectedDate, setSelectedDate] = useState<string>(todayStr);
   const [startDate, setStartDate] = useState<string>(monthStartStr);
   const [endDate, setEndDate] = useState<string>(todayStr);
+  const [compensationTypeFilter, setCompensationTypeFilter] = useState<string>('ALL');
+  const [selectedStaffIds, setSelectedStaffIds] = useState<string[]>([]);
   const [staffFilter, setStaffFilter] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
 
@@ -186,20 +196,93 @@ export const StaffCommissionPage: React.FC = () => {
     );
   }, [cashDrawers, effectiveBranchId, user.id]);
 
+  // Sync startDate and endDate when periodType, selectedMonth, or selectedDate changes
+  useEffect(() => {
+    if (periodType === 'MONTHLY') {
+      const [y, m] = selectedMonth.split('-').map(Number);
+      const lastDay = new Date(y, m, 0).getDate();
+      setStartDate(`${selectedMonth}-01`);
+      setEndDate(`${selectedMonth}-${String(lastDay).padStart(2, '0')}`);
+    } else if (periodType === 'DAILY') {
+      setStartDate(selectedDate);
+      setEndDate(selectedDate);
+    }
+  }, [periodType, selectedMonth, selectedDate]);
+
+  // Eligible Staff filtered by compensation type
+  const eligibleStaffList = useMemo(() => {
+    return staffList.filter((s) => {
+      if (!s.isActive) return false;
+      if (compensationTypeFilter !== 'ALL') {
+        return s.compensationType === compensationTypeFilter;
+      }
+      return isCompensationEligibleForCommission(s.compensationType);
+    });
+  }, [staffList, compensationTypeFilter]);
+
+  // Set of staff IDs that already have a non-cancelled commission run in the selected date range
+  const generatedStaffIdSet = useMemo(() => {
+    const set = new Set<string>();
+    commissionRuns
+      .filter((r) => r.status !== 'CANCELLED' && r.startDate === startDate && r.endDate === endDate)
+      .forEach((r) => {
+        r.statements?.forEach((s) => set.add(s.staffId));
+      });
+    return set;
+  }, [commissionRuns, startDate, endDate]);
+
+  // Initial selection of eligible staff
+  useEffect(() => {
+    if (eligibleStaffList.length > 0) {
+      setSelectedStaffIds((prev) => {
+        const validIds = eligibleStaffList.map((s) => s.id);
+        const existingValid = prev.filter((id) => validIds.includes(id));
+        return existingValid.length > 0 ? existingValid : validIds;
+      });
+    } else {
+      setSelectedStaffIds([]);
+    }
+  }, [eligibleStaffList]);
+
+  const handleSelectAll = () => {
+    setSelectedStaffIds(eligibleStaffList.map((s) => s.id));
+  };
+
+  const handleSelectUngenerated = () => {
+    const ungenerated = eligibleStaffList.filter((s) => !generatedStaffIdSet.has(s.id)).map((s) => s.id);
+    setSelectedStaffIds(ungenerated);
+  };
+
+  const handleClearSelection = () => {
+    setSelectedStaffIds([]);
+  };
+
+  const toggleStaffSelection = (id: string) => {
+    setSelectedStaffIds((prev) => (prev.includes(id) ? prev.filter((sId) => sId !== id) : [...prev, id]));
+  };
+
   // Generate Draft Preview
   const handleGeneratePreview = async () => {
-    if (user.role === 'SUPER_ADMIN' && !generationScope.validate()) return;
+    const branchToUse = user.role === 'SUPER_ADMIN' ? selectedBranchId : effectiveBranchId;
+    if (!branchToUse) {
+      toast.error('Please select a branch.');
+      return;
+    }
+    if (selectedStaffIds.length === 0) {
+      toast.error('Please select at least one staff member to generate commission.');
+      return;
+    }
     try {
       setActionLoading(true);
       setFeedback(null);
       const preview = await salonService.generateCommissionPreview(
-        user.role === 'SUPER_ADMIN' ? generationScope.branchId : effectiveBranchId,
+        branchToUse,
         startDate,
         endDate,
-        user.role === 'SUPER_ADMIN'
-          ? (generationStaffId !== 'ALL' ? generationStaffId : undefined)
-          : (staffFilter !== 'ALL' ? staffFilter : undefined),
-        user
+        undefined,
+        user,
+        selectedStaffIds,
+        compensationTypeFilter !== 'ALL' ? compensationTypeFilter : undefined
       );
       setActiveDraft(preview);
       setShowGenerateForm(false);
@@ -513,20 +596,44 @@ export const StaffCommissionPage: React.FC = () => {
         </div>
       </div>
 
-      {/* ── 3. FILTER TOOLBAR (FROSTED GLASS CARD) ── */}
-      <div className="p-5 sm:p-6 rounded-[24px] border border-white/90 bg-white/75 backdrop-blur-2xl shadow-[0_10px_35px_rgba(35,21,29,0.035),inset_0_1.5px_2px_rgba(255,255,255,1)] space-y-4">
-        <div className="flex items-center gap-2 text-slate-800 font-bold text-sm tracking-wide">
-          <Filter className="w-4 h-4 text-[#B82E69]" />
-          <span>Commission Run Filters & Date Range</span>
+      {/* ── 3. COMMISSION GENERATION & FILTERING CARD (FROSTED GLASS) ── */}
+      <div className="p-5 sm:p-6 rounded-[24px] border border-white/90 bg-white/75 backdrop-blur-2xl shadow-[0_10px_35px_rgba(35,21,29,0.035),inset_0_1.5px_2px_rgba(255,255,255,1)] space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-3 border-b border-rose-100/60">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-purple-50 text-purple-700 flex items-center justify-center border border-purple-200/60">
+              <Calendar className="w-4 h-4" />
+            </div>
+            <div>
+              <h2 className="text-sm sm:text-base font-bold text-slate-900">Generate Staff Commission</h2>
+              <p className="text-[11px] text-slate-500">Filter period, compensation type, and select target staff members</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleGeneratePreview}
+            disabled={actionLoading || selectedStaffIds.length === 0}
+            className="h-9 px-4 font-semibold gap-1.5 shadow-xs text-xs sm:text-sm bg-gradient-to-r from-[#B82E69] to-[#9D2558] hover:from-[#9D2558] hover:to-[#831F4A] disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl transition-all flex items-center justify-center cursor-pointer"
+          >
+            {actionLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Sparkles className="w-4 h-4" />
+            )}
+            <span>Generate Commission ({selectedStaffIds.length} Staff)</span>
+          </button>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-6 gap-3.5 items-end">
+        {/* Filter Controls Row */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-12 gap-3.5 items-end">
           {user.role === 'SUPER_ADMIN' && (
-            <div className="min-w-0">
+            <div className="lg:col-span-3 min-w-0">
               <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Branch</label>
               <select
                 value={selectedBranchId}
-                onChange={(e) => setSelectedBranchId(e.target.value)}
+                onChange={(e) => {
+                  setSelectedBranchId(e.target.value);
+                  setSelectedStaffIds([]);
+                }}
                 className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all cursor-pointer"
               >
                 {allBranches.map((b) => (
@@ -538,71 +645,232 @@ export const StaffCommissionPage: React.FC = () => {
             </div>
           )}
 
-          <div className="min-w-0">
-            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Commission Month</label>
-            <input
-              type="month"
-              value={startDate.slice(0, 7) === endDate.slice(0, 7) ? startDate.slice(0, 7) : ''}
-              onChange={(e) => {
-                const m = e.target.value;
-                if (!m) return;
-                const [y, mo] = m.split('-').map(Number);
-                setStartDate(`${m}-01`);
-                setEndDate(`${m}-${String(new Date(y, mo, 0).getDate()).padStart(2, '0')}`);
-              }}
-              className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
-            />
+          {/* Period Type Buttons */}
+          <div className={user.role === 'SUPER_ADMIN' ? 'lg:col-span-3' : 'lg:col-span-4'}>
+            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Period Type</label>
+            <div className="grid grid-cols-3 gap-1 bg-slate-100/80 p-1 rounded-xl border border-slate-200/60">
+              <button
+                type="button"
+                onClick={() => setPeriodType('MONTHLY')}
+                className={`py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  periodType === 'MONTHLY'
+                    ? 'bg-[#B82E69] text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                Monthly
+              </button>
+              <button
+                type="button"
+                onClick={() => setPeriodType('DAILY')}
+                className={`py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  periodType === 'DAILY'
+                    ? 'bg-[#B82E69] text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                Daily
+              </button>
+              <button
+                type="button"
+                onClick={() => setPeriodType('CUSTOM')}
+                className={`py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  periodType === 'CUSTOM'
+                    ? 'bg-[#B82E69] text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                Custom
+              </button>
+            </div>
           </div>
 
-          <div className="min-w-0">
-            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Start Date</label>
-            <input
-              type="date"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-              className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
-            />
-          </div>
+          {/* Date Pickers based on Period Type */}
+          {periodType === 'MONTHLY' && (
+            <div className={user.role === 'SUPER_ADMIN' ? 'lg:col-span-3 min-w-0' : 'lg:col-span-4 min-w-0'}>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Select Month</label>
+              <input
+                type="month"
+                value={selectedMonth}
+                onChange={(e) => {
+                  setSelectedMonth(e.target.value);
+                  const m = e.target.value;
+                  if (!m) return;
+                  const [y, mo] = m.split('-').map(Number);
+                  setStartDate(`${m}-01`);
+                  setEndDate(`${m}-${String(new Date(y, mo, 0).getDate()).padStart(2, '0')}`);
+                }}
+                className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
+              />
+            </div>
+          )}
 
-          <div className="min-w-0">
-            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">End Date</label>
-            <input
-              type="date"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-              className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
-            />
-          </div>
+          {periodType === 'DAILY' && (
+            <div className={user.role === 'SUPER_ADMIN' ? 'lg:col-span-3 min-w-0' : 'lg:col-span-4 min-w-0'}>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Select Date</label>
+              <input
+                type="date"
+                value={selectedDate}
+                onChange={(e) => {
+                  setSelectedDate(e.target.value);
+                  setStartDate(e.target.value);
+                  setEndDate(e.target.value);
+                }}
+                className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
+              />
+            </div>
+          )}
 
-          <div className="min-w-0">
-            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Employee</label>
+          {periodType === 'CUSTOM' && (
+            <div className={user.role === 'SUPER_ADMIN' ? 'lg:col-span-3 grid grid-cols-2 gap-2 min-w-0' : 'lg:col-span-4 grid grid-cols-2 gap-2 min-w-0'}>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Start Date</label>
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-2.5 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">End Date</label>
+                <input
+                  type="date"
+                  value={endDate}
+                  onChange={(e) => setEndDate(e.target.value)}
+                  className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-2.5 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all"
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Compensation Type Dropdown */}
+          <div className={user.role === 'SUPER_ADMIN' ? 'lg:col-span-3 min-w-0' : 'lg:col-span-4 min-w-0'}>
+            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Compensation Type</label>
             <select
-              value={staffFilter}
-              onChange={(e) => setStaffFilter(e.target.value)}
+              value={compensationTypeFilter}
+              onChange={(e) => {
+                setCompensationTypeFilter(e.target.value);
+                setSelectedStaffIds([]);
+              }}
               className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all cursor-pointer"
             >
-              <option value="ALL">All Eligible Staff</option>
-              {staffList
-                .filter(
-                  (s) =>
-                    s.compensationType === 'MONTHLY_PLUS_COMMISSION' ||
-                    s.compensationType === 'DAILY_PLUS_COMMISSION' ||
-                    s.compensationType === 'COMMISSION_ONLY'
-                )
-                .map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name} ({s.commissionRate}%)
-                  </option>
-                ))}
+              <option value="ALL">All Commission Eligible Types</option>
+              <option value="MONTHLY_PLUS_COMMISSION">Monthly Salary + Commission</option>
+              <option value="DAILY_PLUS_COMMISSION">Daily Rate + Commission</option>
+              <option value="COMMISSION_ONLY">Pure Commission Only</option>
             </select>
           </div>
+        </div>
 
-          <div className="min-w-0">
-            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Run Status</label>
+        {/* Staff Selection Grid */}
+        <div className="pt-2 border-t border-slate-200/80 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-slate-800">
+                Eligible Staff Members ({eligibleStaffList.length})
+              </span>
+              <span className="text-xs text-slate-400">•</span>
+              <span className="text-xs font-medium text-purple-700">
+                {selectedStaffIds.length} Selected
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={handleSelectAll}
+                className="h-7 px-2.5 text-[11px] font-semibold rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 shadow-2xs transition-all cursor-pointer"
+              >
+                Select All
+              </button>
+              <button
+                type="button"
+                onClick={handleSelectUngenerated}
+                className="h-7 px-2.5 text-[11px] font-semibold rounded-lg border border-purple-200 bg-purple-50/60 hover:bg-purple-100/60 text-purple-700 shadow-2xs transition-all cursor-pointer"
+              >
+                Select Ungenerated
+              </button>
+              <button
+                type="button"
+                onClick={handleClearSelection}
+                className="h-7 px-2.5 text-[11px] font-semibold rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-500 shadow-2xs transition-all cursor-pointer"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 max-h-[300px] overflow-y-auto pr-1">
+            {eligibleStaffList.length === 0 ? (
+              <div className="col-span-full py-8 text-center text-slate-400 text-xs">
+                No active staff found matching the selected compensation type.
+              </div>
+            ) : (
+              eligibleStaffList.map((st) => {
+                const isSelected = selectedStaffIds.includes(st.id);
+                const isGenerated = generatedStaffIdSet.has(st.id);
+                return (
+                  <div
+                    key={st.id}
+                    onClick={() => toggleStaffSelection(st.id)}
+                    className={`p-3 rounded-xl border text-xs cursor-pointer select-none transition-all flex items-center justify-between gap-2.5 ${
+                      isSelected
+                        ? 'border-purple-300 bg-purple-50/50 shadow-2xs ring-1 ring-purple-300'
+                        : 'border-white/80 bg-white/70 hover:bg-white shadow-2xs'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => {}}
+                        className="w-4 h-4 rounded text-[#B82E69] focus:ring-[#B82E69]/20 cursor-pointer pointer-events-none shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-semibold text-slate-900 truncate flex items-center gap-1.5">
+                          <span>{st.name}</span>
+                          <span className="text-[10px] text-slate-400 font-mono">({st.employeeCode || st.id.slice(0, 6)})</span>
+                        </div>
+                        <div className="text-[10px] text-slate-500 truncate flex items-center gap-1 mt-0.5">
+                          <span>{st.designation || 'Stylist'}</span>
+                          <span>•</span>
+                          <span className="font-semibold text-purple-700">{st.commissionRate}%</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="shrink-0">
+                      {isGenerated ? (
+                        <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-bold rounded-full">
+                          Generated
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-medium rounded-full">
+                          Ungenerated
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ── 4. DEDICATED MANAGE COMMISSION RUNS SECTION ── */}
+      <div className="space-y-4 pt-2">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-[20px] border border-white/90 bg-white/75 backdrop-blur-2xl shadow-[0_10px_35px_rgba(35,21,29,0.035)]">
+          <div className="flex items-center gap-2 text-slate-900 font-bold text-sm tracking-wide">
+            <Layers className="w-4 h-4 text-[#B82E69]" />
+            <span>Manage Commission Runs ({displayRuns.length})</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Status:</label>
             <select
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
-              className="w-full text-xs rounded-xl border border-white/80 bg-white/80 hover:bg-white px-3 py-2 text-slate-800 focus:outline-hidden focus:ring-2 focus:ring-[#B82E69]/20 focus:border-[#B82E69] shadow-2xs font-medium transition-all cursor-pointer"
+              className="text-xs rounded-xl border border-white/80 bg-white/90 px-3 py-1.5 text-slate-800 shadow-2xs font-medium cursor-pointer"
             >
               <option value="ALL">All Statuses</option>
               <option value="FINALIZED">Finalized</option>
@@ -612,10 +880,9 @@ export const StaffCommissionPage: React.FC = () => {
             </select>
           </div>
         </div>
-      </div>
 
-      {/* Main Commission Runs List */}
-      <div className="space-y-6">
+        {/* Main Commission Runs List */}
+        <div className="space-y-6">
         {displayRuns.length === 0 ? (
           <div className="border border-white/90 bg-white/75 backdrop-blur-2xl shadow-[0_10px_35px_rgba(35,21,29,0.035),inset_0_1.5px_2px_rgba(255,255,255,1)] p-12 text-center rounded-[24px] space-y-4">
             <div className="w-14 h-14 bg-gradient-to-br from-[#FDF2F5] to-white border border-rose-100/80 text-[#B82E69] rounded-2xl flex items-center justify-center mx-auto shadow-2xs">
@@ -820,6 +1087,7 @@ export const StaffCommissionPage: React.FC = () => {
             </div>
           ))
         )}
+        </div>
       </div>
 
       {/* ========================================================================= */}
@@ -1083,24 +1351,26 @@ export const StaffCommissionPage: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => setPaymentForm({ ...paymentForm, method: 'CASH' })}
-                    className={`p-3 rounded-xl border text-center font-medium transition-all ${
+                    className={`p-3 rounded-xl border flex items-center justify-center gap-2 text-center font-medium transition-all ${
                       paymentForm.method === 'CASH'
                         ? 'border-purple-600 bg-purple-50/50 text-purple-700 ring-2 ring-purple-500'
                         : 'border-slate-200 bg-slate-50 text-slate-600'
                     }`}
                   >
-                    Cash (Open Drawer)
+                    <Banknote className="w-4 h-4 text-emerald-600" />
+                    <span>Cash (Open Drawer)</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setPaymentForm({ ...paymentForm, method: 'ONLINE' })}
-                    className={`p-3 rounded-xl border text-center font-medium transition-all ${
+                    className={`p-3 rounded-xl border flex items-center justify-center gap-2 text-center font-medium transition-all ${
                       paymentForm.method === 'ONLINE'
                         ? 'border-purple-600 bg-purple-50/50 text-purple-700 ring-2 ring-purple-500'
                         : 'border-slate-200 bg-slate-50 text-slate-600'
                     }`}
                   >
-                    Bank / Online Account
+                    <Building2 className="w-4 h-4 text-blue-600" />
+                    <span>Bank / Online Account</span>
                   </button>
                 </div>
               </div>

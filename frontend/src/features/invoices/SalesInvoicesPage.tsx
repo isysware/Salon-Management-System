@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import { RefundVoidModal } from './components/RefundVoidModal';
+import { printThermalReceipt } from '@/features/pos/receiptPdf';
 
 const selectClass =
   'w-full text-xs border border-slate-300 rounded-md px-3 py-2 bg-white text-slate-700 focus:outline-hidden focus:ring-1 focus:ring-[#9D2558] focus:border-[#9D2558] transition-colors';
@@ -111,6 +112,23 @@ export const SalesInvoicesPage: React.FC = () => {
   const [refundTargetInvoice, setRefundTargetInvoice] = useState<Invoice | null>(null);
   const [isRefundModalOpen, setIsRefundModalOpen] = useState<boolean>(false);
   const [isLoadingRefundTarget, setIsLoadingRefundTarget] = useState<boolean>(false);
+
+  const [printingInvoiceId, setPrintingInvoiceId] = useState<string | null>(null);
+
+  const handleQuickPrint = async (invoiceId: string) => {
+    setPrintingInvoiceId(invoiceId);
+    try {
+      const fullInvoice = await salonService.getInvoice(invoiceId);
+      if (fullInvoice) {
+        const branch = allBranches.find((b) => b.id === fullInvoice.branchId) || null;
+        printThermalReceipt(fullInvoice, branch);
+      }
+    } catch (err) {
+      console.error('Failed to load invoice receipt details for print:', err);
+    } finally {
+      setPrintingInvoiceId(null);
+    }
+  };
 
   // Load cashiers / accountants list for filter dropdown (for Admin / Super Admin)
   useEffect(() => {
@@ -769,6 +787,19 @@ export const SalesInvoicesPage: React.FC = () => {
                               title="View receipt"
                             >
                               <Eye className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleQuickPrint(row.id)}
+                              disabled={printingInvoiceId === row.id}
+                              className="p-1 rounded text-slate-500 hover:text-[#0047AB] hover:bg-blue-50 transition-colors cursor-pointer"
+                              title="Print thermal receipt (80mm)"
+                            >
+                              {printingInvoiceId === row.id ? (
+                                <Loader2 className="w-4 h-4 animate-spin text-[#0047AB]" />
+                              ) : (
+                                <Printer className="w-4 h-4" />
+                              )}
                             </button>
                             {['SUPER_ADMIN', 'ADMIN'].includes(user.role) && row.lifecycle !== 'VOIDED' && row.lifecycle !== 'REFUNDED' && (
                               <button

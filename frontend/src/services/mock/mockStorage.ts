@@ -113,6 +113,7 @@ export interface StorageSchema {
   supplierReturnSequenceCounters?: Record<string, number>;
   settlementRecordSequenceCounters?: Record<string, number>;
   devices?: Device[];
+  bookings?: any[];
 }
 
 export type StoreListener = (store: StorageSchema) => void;

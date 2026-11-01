@@ -176,7 +176,7 @@ export function buildConsolidatedClientLedger(details: {
       const netAdvance = bPayments.reduce((sum, p) => sum + (p.isRefund ? -p.amount : p.amount), 0);
       advancePaid = round(Math.max(0, netAdvance));
       if (advancePaid === 0 && (inv.advanceAdjusted || 0) > 0) {
-        advancePaid = round(inv.advanceAdjusted);
+        advancePaid = round(inv.advanceAdjusted || 0);
       }
 
       // Add booking advance payments to installment history
@@ -234,7 +234,7 @@ export function buildConsolidatedClientLedger(details: {
     // Calculate Further Payments (POS payments + Dues collections, excluding tips and advance adjustments)
     let furtherPayments = 0;
     for (const p of inv.payments || []) {
-      if (p.kind === 'ADVANCE_ADJUSTMENT' || p.reversedAt) continue;
+      if ((p.kind as string) === 'ADVANCE_ADJUSTMENT' || p.reversedAt) continue;
       const billAlloc = p.billAmountAllocated !== undefined ? Number(p.billAmountAllocated) : round(p.amount - (p.tipAmountAllocated || 0));
       furtherPayments = round(furtherPayments + billAlloc);
 
@@ -277,7 +277,7 @@ export function buildConsolidatedClientLedger(details: {
     const totalPaid = round(advancePaid + furtherPayments);
     const remainingBalance = round(Math.max(0, totalAmount - totalPaid));
 
-    let status = inv.status;
+    let status: any = inv.status;
     if (inv.lifecycle === 'VOIDED') status = 'VOIDED';
     else if (remainingBalance <= 0.01) status = 'PAID';
     else if (totalPaid > 0) status = 'PARTIAL';
@@ -358,7 +358,7 @@ export function buildConsolidatedClientLedger(details: {
       });
     }
 
-    let status = b.status;
+    let status: any = b.status;
     if (remainingBalance <= 0.01 && totalPaid > 0) status = 'PAID';
     else if (totalPaid > 0) status = 'PARTIAL';
 

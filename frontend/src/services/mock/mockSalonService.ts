@@ -1676,6 +1676,7 @@ class MockSalonService implements SalonServiceContract {
         type: 'BOOKING_REMINDER',
         title: `Upcoming Booking (${dayLabel})`,
         description: `${b.clientName} (${b.bookingNumber}) scheduled for ${b.eventDate} at ${b.serviceTime || 'counter'}. Total: PKR ${(Number(b.totalAmount) || 0).toLocaleString('en-PK')}.`,
+        count: 1,
         urgency: diffDays <= 2 ? ('high' as const) : ('medium' as const),
         href: `/operations/bookings?search=${encodeURIComponent(b.bookingNumber)}`,
         isBookingAlert: true,
@@ -1692,6 +1693,7 @@ class MockSalonService implements SalonServiceContract {
         type: 'BOOKING_REMINDER',
         title: `Upcoming Appointment (${dayLabel})`,
         description: `${a.clientName} (${a.appointmentNumber}) scheduled for ${a.date} at ${a.startTime}. Price: PKR ${(Number(a.price) || 0).toLocaleString('en-PK')}.`,
+        count: 1,
         urgency: diffDays <= 2 ? ('high' as const) : ('medium' as const),
         href: `/operations/appointments?date=${a.date}`,
         isBookingAlert: true,
@@ -2536,11 +2538,10 @@ class MockSalonService implements SalonServiceContract {
               compError = 'Component service name is missing.';
               break;
             }
-            const newCode = `SVR-${(services.length + 1).toString().padStart(4, '0')}`;
+            const newCode = `SVR-${((store.services || []).length + 1).toString().padStart(4, '0')}`;
             srv = {
               id: `srv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
               branchId: effectiveBranchId,
-              categoryId: 'cat-general',
               category: 'General',
               code: newCode,
               name: rawServiceName,
@@ -2550,7 +2551,7 @@ class MockSalonService implements SalonServiceContract {
               taxTreatment: 'BRANCH_DEFAULT',
               isActive: true,
             };
-            services.push(srv);
+            store.services.push(srv);
             branchServices.push(srv);
           }
 
@@ -7739,7 +7740,9 @@ class MockSalonService implements SalonServiceContract {
     startDate: string,
     endDate: string,
     staffId?: string,
-    actor?: User
+    actor?: User,
+    staffIds?: string[],
+    compensationType?: string
   ): Promise<CommissionRun> {
     const authenticatedActor = this.getAuthenticatedActor(actor);
     if (authenticatedActor.role === 'ACCOUNTANT') {
@@ -7767,12 +7770,13 @@ class MockSalonService implements SalonServiceContract {
       }
     }
 
+    const targetStaffIds = staffIds && staffIds.length > 0 ? staffIds : (staffId && staffId !== 'ALL' ? [staffId] : null);
     const eligibleStaff = store.staff.filter(
       (s: StaffMember) =>
         s.branchId === branchId &&
         s.isActive &&
-        isCompensationEligibleForCommission(s.compensationType) &&
-        (!staffId || s.id === staffId)
+        (compensationType && compensationType !== 'ALL' ? s.compensationType === compensationType : true) &&
+        (targetStaffIds ? targetStaffIds.includes(s.id) : isCompensationEligibleForCommission(s.compensationType))
     );
 
     const statements: CommissionStatementRecord[] = [];
