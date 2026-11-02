@@ -1,13 +1,17 @@
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { authorize } from '../../middleware/authorize.js';
 import { validate } from '../../middleware/validate.js';
 import { idempotency } from '../../middleware/idempotency.js';
 import * as v from './bookings.schema.js';
 import * as c from './bookings.controller.js';
+
 const router = Router();
 const admins = authorize('SUPER_ADMIN', 'ADMIN');
-router.use(authenticate, authorize('SUPER_ADMIN', 'ADMIN', 'ACCOUNTANT'));
+
+router.use(authenticate, tenantContext, authorize('SUPER_ADMIN', 'ADMIN', 'ACCOUNTANT'));
+
 router.get('/', validate(v.listQuery, 'query'), c.list);
 router.get('/collections', validate(v.listQuery, 'query'), c.collections);
 router.post('/', admins, idempotency, validate(v.createSchema), c.create);
@@ -19,4 +23,5 @@ router.post('/:id/refunds', admins, idempotency, validate(v.refundSchema), c.ref
 router.post('/:id/cancel', admins, idempotency, validate(v.cancelSchema), c.cancel);
 router.get('/:id/ledger', c.ledger);
 router.get('/:id/pos-handoff', c.handoff);
+
 export default router;

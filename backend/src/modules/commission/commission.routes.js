@@ -4,6 +4,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { authenticate } from '../../middleware/authenticate.js';
 import { authorize } from '../../middleware/authorize.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { validate } from '../../middleware/validate.js';
 import { idempotency } from '../../middleware/idempotency.js';
 import { asyncHandler } from '../../lib/asyncHandler.js';
@@ -14,9 +15,9 @@ const reason = z.object({ reason: z.string().trim().min(1, 'A reason is required
 const send = (fn, status = 200) => asyncHandler(async (req, res) => res.status(status).json({ data: await fn(req) }));
 
 const router = Router();
-router.get('/statements/me', authenticate, authorize('STAFF'), send((req) => s.personalStatements(req.user)));
+router.get('/statements/me', authenticate, tenantContext, authorize('STAFF'), send((req) => s.personalStatements(req.user)));
 
-router.use(authenticate, authorize('SUPER_ADMIN', 'ADMIN'));
+router.use(authenticate, tenantContext, authorize('SUPER_ADMIN', 'ADMIN'));
 router.get('/runs', validate(z.object({ branchId: z.string().optional() }), 'query'), send((req) => s.listRuns(req.user, req.query)));
 // Period = explicit startDate/endDate, or `month` (YYYY-MM) → 1st..last day of that month.
 const monthRange = (body) => {

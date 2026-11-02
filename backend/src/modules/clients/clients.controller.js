@@ -18,3 +18,4 @@ export const getOne  = send(async (req) => {
 export const create  = send((req) => s.createClient(req.body, req.user), 201);
 export const update  = send((req) => s.updateClient(req.params.id, req.body, req.user));
 export const archive = send((req) => s.archiveClient(req.params.id, req.body.isArchived, req.user));
+export const remove  = send((req) => s.deleteClient(req.params.id, req.user));

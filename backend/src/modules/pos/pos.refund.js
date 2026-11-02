@@ -49,6 +49,9 @@ export const refundInvoice = async (input, actor) => {
     await tx.$executeRaw`SELECT 1 FROM "Invoice" WHERE id = ${input.invoiceId} FOR UPDATE`;
     const invoice = await tx.invoice.findUnique({ where: { id: input.invoiceId }, include: refundInclude });
     if (!invoice) throw badRequest('INVOICE_NOT_FOUND', `Invoice '${input.invoiceId}' not found.`);
+    if (!invoice.tenantId || invoice.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Cross-tenant access is forbidden.');
+    }
     assertBranchAccess(actor, invoice.branchId, 'Access Denied: Cannot refund invoices of another branch.');
     await lockCommissionBranch(tx, invoice.branchId);
     if (['VOIDED', 'REFUNDED'].includes(invoice.lifecycle)) throw conflict('INVOICE_CLOSED', `Invoice '${invoice.invoiceNumber}' is already ${invoice.lifecycle.toLowerCase()}.`);
@@ -79,6 +82,7 @@ export const refundInvoice = async (input, actor) => {
     const refundNumber = await nextSequence(tx, branch.code, isVoid ? 'VOID' : 'RFD');
     const refund = await tx.invoiceRefund.create({
       data: {
+        tenantId: actor.tenantId,
         refundNumber, invoiceId: invoice.id, type: isVoid ? 'VOID' : 'REFUND', refundDate: dateOnly(today),
         netReversed: 0, taxReversed: 0, reason: input.reason, byUserId: actor.id, byName: actor.name,
       },
@@ -106,12 +110,13 @@ export const refundInvoice = async (input, actor) => {
       netReversed = netReversed.plus(net);
       taxReversed = taxReversed.plus(tax);
       const restock = line.type === 'PRODUCT' ? (r.restock || 'RESALABLE') : 'NONE';
-      await tx.refundLine.create({ data: { refundId: refund.id, lineId: line.id, quantity: r.quantity, net, tax, restock } });
+      await tx.refundLine.create({ data: { tenantId: actor.tenantId, refundId: refund.id, lineId: line.id, quantity: r.quantity, net, tax, restock } });
 
       // Commission reversal on the refund date, at the original rate snapshot (spec §4.3).
       const reverse = (staffId, attributedNet, rate, componentId) =>
         toDec(rate).isZero() ? null : tx.commissionEvent.create({
           data: {
+        tenantId: actor.tenantId,
             branchId: invoice.branchId, staffId, invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber, lineId: line.id,
             componentId: componentId ?? null, type: 'REVERSAL', attributedNet, rate, eventDate: dateOnly(today),
             amount: round2(attributedNet.times(rate).dividedBy(100)),
@@ -179,11 +184,13 @@ export const refundInvoice = async (input, actor) => {
 
     await tx.invoiceRefund.update({
       where: { id: refund.id },
-      data: { netReversed, taxReversed, tipReversed: tipRefund, cashOut, receivableCancelled: round2(Decimal_max0(prevDue.minus(newDue))) },
+      data: {
+        tenantId: actor.tenantId, netReversed, taxReversed, tipReversed: tipRefund, cashOut, receivableCancelled: round2(Decimal_max0(prevDue.minus(newDue))) },
     });
     await tx.invoice.update({
       where: { id: invoice.id },
-      data: { lifecycle, status, amountDue: newDue, amountPaid: round2(toDec(invoice.amountPaid).minus(cashOut)) },
+      data: {
+        tenantId: actor.tenantId, lifecycle, status, amountDue: newDue, amountPaid: round2(toDec(invoice.amountPaid).minus(cashOut)) },
     });
     await auditLog(tx, {
       userId: actor.id, userName: actor.name, action: isVoid ? 'INVOICE_VOIDED' : 'INVOICE_REFUNDED', entity: 'Invoice',
@@ -199,10 +206,10 @@ export const refundInvoice = async (input, actor) => {
 const Decimal_max0 = (d) => (d.lessThan(0) ? toDec(0) : d);
 
 export const listRefunds = async (actor, invoiceId) => {
-  const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { branchId: true, processedByUserId: true } });
+  const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { branchId: true, processedByUserId: true, tenantId: true } });
   if (!inv) throw badRequest('INVOICE_NOT_FOUND', `Invoice '${invoiceId}' not found.`);
   assertInvoiceAccess(actor, inv);
-  const rows = await prisma.invoiceRefund.findMany({ where: { invoiceId }, include: { lines: true }, orderBy: { createdAt: 'asc' } });
+  const rows = await prisma.invoiceRefund.findMany({ where: { invoiceId, ...(actor.tenantId ? { tenantId: actor.tenantId } : {}) }, include: { lines: true }, orderBy: { createdAt: 'asc' } });
   return rows.map((r) => ({
     id: r.id, refundNumber: r.refundNumber, type: r.type, refundDate: r.refundDate.toISOString().slice(0, 10),
     netReversed: toDec(r.netReversed).toNumber(), taxReversed: toDec(r.taxReversed).toNumber(), tipReversed: toDec(r.tipReversed).toNumber(),

@@ -6,7 +6,7 @@
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { dateOnly, getBusinessDate, ymd } from '../../lib/dates.js';
 import { round2, toDec } from '../../lib/money.js';
 import { nextSequence } from '../../lib/sequence.js';
@@ -17,8 +17,16 @@ import { lockCommissionBranch, assertCommissionAvailable } from './payrollCommis
 
 const runInclude = { statements: { include: { payments: true } } };
 const noAccountant = (actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (actor.role === 'ACCOUNTANT') throw forbidden('FORBIDDEN', 'Access Denied: Accountants are not authorized to access staff commission.');
   if (actor.role === 'STAFF') throw forbidden('FORBIDDEN', 'Access Denied: Staff members cannot manage commission runs.');
+};
+
+const assertTenantBranch = async (tx, actor, branchId) => {
+  if (!branchId || branchId === 'ALL') return;
+  const branch = await tx.branch.findUnique({ where: { id: branchId }, select: { id: true, tenantId: true } });
+  if (!branch) throw notFound('BRANCH_NOT_FOUND', `Branch '${branchId}' not found.`);
+  assertTenantAccess(actor, branch);
 };
 
 const toPaymentDTO = (p) => ({
@@ -61,17 +69,34 @@ const toRunDTO = (run, branchName, consumedIds = []) => {
   };
 };
 
-const runDTO = async (tx, id) => {
+const runDTO = async (tx, id, actor) => {
   const run = await tx.commissionRun.findUnique({ where: { id }, include: runInclude });
+  if (!run) return null;
+  if (actor?.tenantId) assertTenantAccess(actor, run);
   const branch = await tx.branch.findUnique({ where: { id: run.branchId } });
-  const consumed = await tx.commissionEvent.findMany({ where: { consumedByRunId: id }, select: { id: true } });
+  const consumed = await tx.commissionEvent.findMany({
+    where: { ...(actor?.tenantId ? { tenantId: actor.tenantId } : {}), consumedByRunId: id },
+    select: { id: true },
+  });
   return toRunDTO(run, branch?.name, consumed.map((e) => e.id));
 };
 
 /** Build one statement per eligible staff member from unconsumed events in the window. */
-export const buildStatements = async (tx, branchId, startDate, endDate, staffId, payrollStaffIds, staffIds, compensationType) => {
+export const buildStatements = async (tx, actorOrBranchId, branchIdOrStart, startDateOrEnd, endDateOrStaff, staffIdOrPayroll, payrollOrStaffIds, staffIdsOrComp, maybeComp) => {
+  const hasActor = typeof actorOrBranchId === 'object' && actorOrBranchId !== null;
+  const actor = hasActor ? actorOrBranchId : null;
+  const branchId = hasActor ? branchIdOrStart : actorOrBranchId;
+  const startDate = hasActor ? startDateOrEnd : branchIdOrStart;
+  const endDate = hasActor ? endDateOrStaff : startDateOrEnd;
+  const staffId = hasActor ? staffIdOrPayroll : endDateOrStaff;
+  const payrollStaffIds = hasActor ? payrollOrStaffIds : staffIdOrPayroll;
+  const staffIds = hasActor ? staffIdsOrComp : payrollOrStaffIds;
+  const compensationType = hasActor ? maybeComp : staffIdsOrComp;
+
+  const tenantFilter = actor?.tenantId ? { tenantId: actor.tenantId } : {};
   const targetStaffIds = payrollStaffIds || (staffIds && staffIds.length > 0 ? staffIds : (staffId && staffId !== 'ALL' ? [staffId] : null));
   const where = {
+    ...tenantFilter,
     branchId,
     ...(targetStaffIds ? { id: { in: targetStaffIds } } : { isActive: true }),
     ...(compensationType && compensationType !== 'ALL' ? { compensationType } : {})
@@ -79,11 +104,20 @@ export const buildStatements = async (tx, branchId, startDate, endDate, staffId,
   const staffRows = await tx.staff.findMany({ where, orderBy: { employeeCode: 'asc' } });
   const eligible = targetStaffIds ? staffRows : staffRows.filter((s) => isCompensationEligibleForCommission(s.compensationType));
   const events = await tx.commissionEvent.findMany({
-    where: { branchId, consumedByRunId: null, eventDate: { gte: dateOnly(startDate), lte: dateOnly(endDate) }, staffId: { in: eligible.map((s) => s.id) } },
+    where: {
+      ...tenantFilter,
+      branchId,
+      consumedByRunId: null,
+      eventDate: { gte: dateOnly(startDate), lte: dateOnly(endDate) },
+      staffId: { in: eligible.map((s) => s.id) },
+    },
     orderBy: [{ eventDate: 'asc' }, { createdAt: 'asc' }],
   });
   const lineIds = [...new Set(events.map((e) => e.lineId))];
-  const lines = await tx.invoiceLine.findMany({ where: { id: { in: lineIds } }, include: { components: true, invoice: { select: { clientName: true } } } });
+  const lines = await tx.invoiceLine.findMany({
+    where: { ...(actor?.tenantId ? { invoice: { tenantId: actor.tenantId } } : {}), id: { in: lineIds } },
+    include: { components: true, invoice: { select: { clientName: true } } },
+  });
   const lineById = new Map(lines.map((l) => [l.id, l]));
 
   return eligible.map((s) => {
@@ -127,10 +161,21 @@ const Decimal_max0 = (d) => (d.lessThan(0) ? toDec(0) : d);
 
 export const listRuns = async (actor, { branchId } = {}) => {
   noAccountant(actor);
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId);
+    await assertTenantBranch(prisma, actor, branchId);
+  }
   const b = resolveReadBranch(actor, branchId);
-  const runs = await prisma.commissionRun.findMany({ where: b ? { branchId: b } : {}, include: runInclude, orderBy: { generatedAt: 'desc' } });
-  const branches = new Map((await prisma.branch.findMany()).map((x) => [x.id, x.name]));
-  const consumed = await prisma.commissionEvent.findMany({ where: { consumedByRunId: { in: runs.map((r) => r.id) } }, select: { id: true, consumedByRunId: true } });
+  const runs = await prisma.commissionRun.findMany({
+    where: { tenantId: actor.tenantId, ...(b ? { branchId: b } : {}) },
+    include: runInclude,
+    orderBy: { generatedAt: 'desc' },
+  });
+  const branches = new Map((await prisma.branch.findMany({ where: { tenantId: actor.tenantId } })).map((x) => [x.id, x.name]));
+  const consumed = await prisma.commissionEvent.findMany({
+    where: { tenantId: actor.tenantId, consumedByRunId: { in: runs.map((r) => r.id) } },
+    select: { id: true, consumedByRunId: true },
+  });
   return runs.map((r) => toRunDTO(r, branches.get(r.branchId), consumed.filter((e) => e.consumedByRunId === r.id).map((e) => e.id)));
 };
 
@@ -141,16 +186,20 @@ export const generatePreview = async (actor, { branchId: requested, startDate, e
   if (startDate > endDate) throw badRequest('INVALID_RANGE', 'Start date must be on or before end date.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot generate commission for another branch.');
   return prisma.$transaction(async (tx) => {
+    await assertTenantBranch(tx, actor, branchId);
     await lockCommissionBranch(tx, branchId);
-    const built = await buildStatements(tx, branchId, startDate, endDate, staffId, null, staffIds, compensationType);
-    await tx.commissionRun.deleteMany({ where: { branchId, status: 'DRAFT', startDate: dateOnly(startDate), endDate: dateOnly(endDate) } });
+    const built = await buildStatements(tx, actor, branchId, startDate, endDate, staffId, null, staffIds, compensationType);
+    await tx.commissionRun.deleteMany({
+      where: { tenantId: actor.tenantId, branchId, status: 'DRAFT', startDate: dateOnly(startDate), endDate: dateOnly(endDate) },
+    });
     const run = await tx.commissionRun.create({
       data: {
+        tenantId: actor.tenantId,
         branchId, startDate: dateOnly(startDate), endDate: dateOnly(endDate), generatedByUserId: actor.id, generatedByName: actor.name,
-        statements: { create: built.map((b) => ({ staffId: b.staff.id, snapshot: b.snapshot, netPayable: b.net })) },
+        statements: { create: built.map((b) => ({ tenantId: actor.tenantId, staffId: b.staff.id, snapshot: b.snapshot, netPayable: b.net })) },
       },
     });
-    return runDTO(tx, run.id);
+    return runDTO(tx, run.id, actor);
   });
 };
 
@@ -159,33 +208,42 @@ export const finalizeRun = async (actor, runId) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.commissionRun.findUnique({ where: { id: runId } });
     if (!header) throw notFound('COMMISSION_NOT_FOUND', 'Commission run not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot finalize commission for another branch.');
     await lockCommissionBranch(tx, header.branchId);
     await tx.$executeRaw`SELECT 1 FROM "CommissionRun" WHERE id = ${runId} FOR UPDATE`;
     const draft = await tx.commissionRun.findUnique({ where: { id: runId } });
     if (!draft) throw notFound('COMMISSION_NOT_FOUND', `Commission run '${runId}' not found. Please generate a preview first.`);
+    assertTenantAccess(actor, draft);
     assertBranchAccess(actor, draft.branchId, 'Access Denied: Cannot finalize commission for another branch.');
     if (draft.status !== 'DRAFT') throw conflict('NOT_DRAFT', `Commission run is already in status '${draft.status}' and cannot be finalized.`);
 
     // Serialise finalizations per branch so two runs can never consume the same events.
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`commission:${draft.branchId}`}::text))`;
-    const draftStatements = await tx.commissionStatement.findMany({ where: { runId }, select: { staffId: true } });
+    const draftStatements = await tx.commissionStatement.findMany({
+      where: { tenantId: actor.tenantId, runId },
+      select: { staffId: true },
+    });
     const draftStaffIds = draftStatements.map((s) => s.staffId);
-    const built = await buildStatements(tx, draft.branchId, ymd(draft.startDate), ymd(draft.endDate), null, null, draftStaffIds.length > 0 ? draftStaffIds : null);
+    const built = await buildStatements(tx, actor, draft.branchId, ymd(draft.startDate), ymd(draft.endDate), null, null, draftStaffIds.length > 0 ? draftStaffIds : null);
     const branch = await tx.branch.findUnique({ where: { id: draft.branchId } });
     const year = Number(ymd(draft.startDate).slice(0, 4));
-    await tx.commissionStatement.deleteMany({ where: { runId } });
+    await tx.commissionStatement.deleteMany({ where: { tenantId: actor.tenantId, runId } });
     for (const b of built) {
       await tx.commissionStatement.create({
-        data: { runId, staffId: b.staff.id, statementNumber: await nextSequence(tx, branch.code, 'CS', year), snapshot: b.snapshot, netPayable: b.net },
+        data: { tenantId: actor.tenantId, runId, staffId: b.staff.id, statementNumber: await nextSequence(tx, branch.code, 'CS', year), snapshot: b.snapshot, netPayable: b.net },
       });
-      if (b.eventIds.length) await tx.commissionEvent.updateMany({ where: { id: { in: b.eventIds } }, data: { consumedByRunId: runId } });
+      if (b.eventIds.length) await tx.commissionEvent.updateMany({
+        where: { tenantId: actor.tenantId, id: { in: b.eventIds } },
+        data: { consumedByRunId: runId },
+      });
     }
     await tx.commissionRun.update({
       where: { id: runId },
       data: { status: 'FINALIZED', commissionNumber: await nextSequence(tx, branch.code, 'COM', year), finalizedAt: new Date(), finalizedByUserId: actor.id, finalizedByName: actor.name },
     });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'COMMISSION_FINALIZED', entity: 'CommissionRun', entityId: runId, branchId: draft.branchId });
-    return runDTO(tx, runId);
+    return runDTO(tx, runId, actor);
   });
 };
 
@@ -194,20 +252,23 @@ export const cancelRun = async (actor, runId, reason) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.commissionRun.findUnique({ where: { id: runId } });
     if (!header) throw notFound('COMMISSION_NOT_FOUND', 'Commission run not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot cancel commission run for another branch.');
     await lockCommissionBranch(tx, header.branchId);
     const run = await tx.commissionRun.findUnique({ where: { id: runId }, include: { payments: true, statements: true } });
     if (!run) throw notFound('COMMISSION_NOT_FOUND', `Commission run '${runId}' not found.`);
+    assertTenantAccess(actor, run);
     assertBranchAccess(actor, run.branchId, 'Access Denied: Cannot cancel commission run for another branch.');
     if (run.status === 'CANCELLED') throw conflict('ALREADY_CANCELLED', 'This commission run is already cancelled.');
     if (run.statements.some((s) => s.payrollPayslipId)) throw conflict('COMMISSION_LINKED_TO_PAYROLL', 'Cancel the linked payroll before cancelling this commission run.');
     if (run.payments.some((p) => p.status === 'COMPLETED')) throw conflict('HAS_PAYMENTS', 'Runs with payments cannot be cancelled until all payments are properly reversed.');
-    await tx.commissionEvent.updateMany({ where: { consumedByRunId: runId }, data: { consumedByRunId: null } });
+    await tx.commissionEvent.updateMany({ where: { tenantId: actor.tenantId, consumedByRunId: runId }, data: { consumedByRunId: null } });
     await tx.commissionRun.update({
       where: { id: runId },
       data: { status: 'CANCELLED', cancellationReason: reason, cancelledAt: new Date(), cancelledByUserId: actor.id, cancelledByName: actor.name },
     });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'COMMISSION_CANCELLED', entity: 'CommissionRun', entityId: runId, branchId: run.branchId, after: { reason } });
-    return runDTO(tx, runId);
+    return runDTO(tx, runId, actor);
   });
 };
 
@@ -218,25 +279,29 @@ export const recordPayment = async (actor, input) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.commissionRun.findUnique({ where: { id: input.commissionRunId } });
     if (!header) throw notFound('COMMISSION_NOT_FOUND', 'Commission run not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot record payment for another branch.');
     await lockCommissionBranch(tx, header.branchId);
     const requestKey = input.idempotencyKey ? `${actor.id}:commission:${input.idempotencyKey}` : null;
     if (requestKey) {
       const replay = await tx.commissionPayment.findUnique({ where: { requestKey } });
-      if (replay) return { commissionRun: await runDTO(tx, replay.runId), payment: toPaymentDTO(replay) };
+      if (replay) return { commissionRun: await runDTO(tx, replay.runId, actor), payment: toPaymentDTO(replay) };
     }
     await tx.$executeRaw`SELECT 1 FROM "CommissionStatement" WHERE id = ${input.statementId} FOR UPDATE`;
     const run = await tx.commissionRun.findUnique({ where: { id: input.commissionRunId }, include: runInclude });
     if (!run) throw notFound('COMMISSION_NOT_FOUND', `Commission run '${input.commissionRunId}' not found.`);
+    assertTenantAccess(actor, run);
     assertBranchAccess(actor, run.branchId, 'Access Denied: Cannot record payment for another branch.');
     if (['DRAFT', 'CANCELLED'].includes(run.status)) throw conflict('RUN_NOT_PAYABLE', `Cannot record payment on a commission run in '${run.status}' status.`);
     const st = run.statements.find((s) => s.id === input.statementId);
     if (!st) throw notFound('STATEMENT_NOT_FOUND', `Statement '${input.statementId}' not found in this commission run.`);
+    assertTenantAccess(actor, st);
     if (st.payrollPayslipId) throw conflict('COMMISSION_LINKED_TO_PAYROLL', 'This commission is included in payroll. Pay or reverse it through the linked payslip.');
     const dto = toStatementDTO(st, run);
     const amount = round2(input.amount);
     if (amount.lessThanOrEqualTo(0)) throw badRequest('INVALID_AMOUNT', 'Payment must be greater than zero.');
     if (amount.greaterThan(dto.outstandingAmount)) throw badRequest('OVERPAYMENT', `Payment amount (${amount}) exceeds outstanding commission balance (${dto.outstandingAmount}).`);
-    await assertCommissionAvailable(tx, run.branchId, st.staffId, amount);
+    await assertCommissionAvailable(tx, actor, run.branchId, st.staffId, amount);
 
     const branch = await tx.branch.findUnique({ where: { id: run.branchId } });
     const paymentNumber = await nextSequence(tx, branch.code, 'COMPAY', Number((await getBusinessDate(tx)).slice(0, 4)));
@@ -246,12 +311,13 @@ export const recordPayment = async (actor, input) => {
     });
     const payment = await tx.commissionPayment.create({
       data: {
+        tenantId: actor.tenantId,
         paymentNumber, runId: run.id, statementId: st.id, staffId: st.staffId, staffName: dto.staffName, branchId: run.branchId, amount, requestKey,
         method: input.method, ...source, reference: input.reference || '', notes: input.notes || null, paidByUserId: actor.id, paidByName: actor.name,
       },
     });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'COMMISSION_PAID', entity: 'CommissionPayment', entityId: payment.id, branchId: run.branchId, after: { amount: amount.toNumber() } });
-    return { commissionRun: await runDTO(tx, run.id), payment: toPaymentDTO(payment) };
+    return { commissionRun: await runDTO(tx, run.id, actor), payment: toPaymentDTO(payment) };
   });
 };
 
@@ -260,10 +326,13 @@ export const reversePayment = async (actor, paymentId, reason) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.commissionPayment.findUnique({ where: { id: paymentId } });
     if (!header) throw notFound('PAYMENT_NOT_FOUND', 'Commission payment not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot reverse payments of another branch.');
     await lockCommissionBranch(tx, header.branchId);
     await tx.$executeRaw`SELECT 1 FROM "CommissionPayment" WHERE id = ${paymentId} FOR UPDATE`;
     const p = await tx.commissionPayment.findUnique({ where: { id: paymentId } });
     if (!p) throw notFound('PAYMENT_NOT_FOUND', `Commission payment '${paymentId}' not found.`);
+    assertTenantAccess(actor, p);
     assertBranchAccess(actor, p.branchId, 'Access Denied: Cannot reverse payments of another branch.');
     if (p.payrollPaymentId) throw conflict('COMMISSION_LINKED_TO_PAYROLL', 'Reverse the combined payment through Payroll.');
     const statement = await tx.commissionStatement.findUnique({ where: { id: p.statementId } });
@@ -283,9 +352,14 @@ export const reversePayment = async (actor, paymentId, reason) => {
 };
 
 export const personalStatements = async (actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (!actor.staffId) throw forbidden('FORBIDDEN', 'Staff record associated with the authenticated user could not be found.');
+  const staff = await prisma.staff.findUnique({ where: { id: actor.staffId } });
+  if (!staff || staff.tenantId !== actor.tenantId) throw forbidden('FORBIDDEN', 'Access Denied: Staff record not found.');
+
   const rows = await prisma.commissionStatement.findMany({
-    where: { staffId: actor.staffId, run: { status: { notIn: ['DRAFT', 'CANCELLED'] } } }, include: { payments: true, run: true },
+    where: { tenantId: actor.tenantId, staffId: actor.staffId, run: { status: { notIn: ['DRAFT', 'CANCELLED'] } } },
+    include: { payments: true, run: true },
   });
   return rows.map((st) => toStatementDTO(st, st.run)).sort((a, b) => b.endDate.localeCompare(a.endDate));
 };

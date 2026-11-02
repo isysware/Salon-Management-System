@@ -5,8 +5,8 @@ import { nextSequence } from '../../lib/sequence.js';
 
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
-import { badRequest, conflict, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { round2, toDec } from '../../lib/money.js';
 import { toCategoryDTO, toServiceDTO, toPackageDTO } from './catalogue.mapper.js';
 
@@ -14,50 +14,98 @@ const serviceInclude = { category: true };
 const packageInclude = { components: { include: { service: true } } };
 
 const audit = (tx, actor, action, entity, entityId, branchId, before, after) =>
-  auditLog(tx, { userId: actor.id, userName: actor.name, action, entity, entityId, branchId, before, after });
+  auditLog(tx, { tenantId: actor.tenantId, userId: actor.id, userName: actor.name, action, entity, entityId, branchId, before, after });
 
-const assertActiveBranch = async (tx, branchId) => {
+const assertActiveBranch = async (tx, branchId, actor) => {
   const branch = await tx.branch.findUnique({ where: { id: branchId } });
   if (!branch || !branch.isActive) throw badRequest('BRANCH_INACTIVE', `Branch '${branchId}' is invalid or deactivated.`);
+  assertTenantAccess(actor, branch, 'Access Denied: Branch belongs to another salon company.');
 };
 
-const assertTaxRule = async (tx, branchId, taxTreatment, ruleId) => {
+const assertTaxRule = async (tx, branchId, taxTreatment, ruleId, actor) => {
   if (taxTreatment !== 'SPECIFIC_RULE') return null;
   if (!ruleId) throw badRequest('TAX_RULE_REQUIRED', 'A specific tax rule must be selected when Tax Treatment is set to Specific Rule.');
-  const rule = await tx.taxRule.findFirst({ where: { id: ruleId, OR: [{ branchId }, { branches: { some: { id: branchId } } }] } });
+  const rule = await tx.taxRule.findFirst({
+    where: {
+      id: ruleId,
+      OR: [{ branchId }, { branches: { some: { id: branchId } } }],
+      ...(actor?.tenantId ? { tenantId: actor.tenantId } : {}),
+    },
+  });
   if (!rule) throw badRequest('TAX_RULE_NOT_FOUND', 'Selected specific tax rule does not exist in this branch.');
   if (!rule.isActive) throw badRequest('TAX_RULE_INACTIVE', `Selected tax rule '${rule.name}' is currently deactivated.`);
   return ruleId;
 };
 
 /** The UI sends a category NAME; reuse the branch category or create it. */
-const categoryIdFor = async (tx, branchId, name) => {
+const categoryIdFor = async (tx, branchId, name, actor) => {
   const clean = (name || 'General').trim();
-  const existing = await tx.serviceCategory.findFirst({ where: { branchId, name: { equals: clean, mode: 'insensitive' } } });
+  const existing = await tx.serviceCategory.findFirst({
+    where: {
+      branchId,
+      name: { equals: clean, mode: 'insensitive' },
+      ...(actor?.tenantId ? { tenantId: actor.tenantId } : {}),
+    },
+  });
   if (existing) {
     if (!existing.isActive) await tx.serviceCategory.update({ where: { id: existing.id }, data: { isActive: true } });
     return existing.id;
   }
-  return (await tx.serviceCategory.create({ data: { branchId, name: clean } })).id;
+  return (await tx.serviceCategory.create({
+    data: {
+      tenantId: actor.tenantId,
+      branchId,
+      name: clean,
+    },
+  })).id;
 };
 
 // ═══ CATEGORIES ═══════════════════════════════════════════════════════════════
 
-export const listCategories = async (actor, branchId) => {
-  const b = resolveReadBranch(actor, branchId);
-  const cats = await prisma.serviceCategory.findMany({ where: { ...(b ? { branchId: b } : {}), isActive: true }, orderBy: { name: 'asc' } });
+export const listCategories = async (actor, requestedBranchId) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  const b = resolveReadBranch(actor, requestedBranchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view categories of another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+  const cats = await prisma.serviceCategory.findMany({
+    where: {
+      tenantId: actor.tenantId,
+      ...(b ? { branchId: b } : {}),
+      isActive: true,
+    },
+    orderBy: { name: 'asc' },
+  });
   return cats.map(toCategoryDTO);
 };
 
 export const createCategory = async ({ branchId: requested, name }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot manage categories of another branch.');
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.serviceCategory.findFirst({ where: { branchId, name: { equals: name, mode: 'insensitive' } } });
+    await assertActiveBranch(tx, branchId, actor);
+    const existing = await tx.serviceCategory.findFirst({
+      where: {
+        branchId,
+        tenantId: actor.tenantId,
+        name: { equals: name, mode: 'insensitive' },
+      },
+    });
     if (existing) {
       if (existing.isActive) throw conflict('CATEGORY_EXISTS', `Category '${name}' already exists.`);
       return toCategoryDTO(await tx.serviceCategory.update({ where: { id: existing.id }, data: { isActive: true } }));
     }
-    const cat = await tx.serviceCategory.create({ data: { branchId, name } });
+    const cat = await tx.serviceCategory.create({
+      data: {
+        tenantId: actor.tenantId,
+        branchId,
+        name,
+      },
+    });
     await audit(tx, actor, 'SERVICE_CATEGORY_CREATED', 'ServiceCategory', cat.id, branchId, null, cat);
     return toCategoryDTO(cat);
   });
@@ -65,10 +113,19 @@ export const createCategory = async ({ branchId: requested, name }, actor) => {
 
 // ═══ SERVICES ═════════════════════════════════════════════════════════════════
 
-export const listServices = async (actor, branchId) => {
-  const b = resolveReadBranch(actor, branchId);
+export const listServices = async (actor, requestedBranchId) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  const b = resolveReadBranch(actor, requestedBranchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view services from another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
   const services = await prisma.service.findMany({
     where: {
+      tenantId: actor.tenantId,
       ...(b ? { branchId: b } : {}),
       OR: [
         { description: null },
@@ -87,33 +144,42 @@ export const listServices = async (actor, branchId) => {
 };
 
 export const getService = async (actor, id) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const s = await prisma.service.findUnique({ where: { id }, include: serviceInclude });
   if (!s) return null;
+  assertTenantAccess(actor, s, 'Access Denied: Service belongs to another salon company.');
   assertBranchAccess(actor, s.branchId, 'Access Denied: Cannot view service from another branch.');
   return toServiceDTO(s);
 };
 
 const generateNextServiceCode = async (tx) => nextSequence(tx, '', 'SVR');
 
-const assertServiceCodeFree = async (tx, branchId, code, exceptId) => {
+const assertServiceCodeFree = async (tx, branchId, code, exceptId, tenantId) => {
   const clash = await tx.service.findFirst({
-    where: { branchId, code: { equals: code, mode: 'insensitive' }, ...(exceptId ? { NOT: { id: exceptId } } : {}) },
+    where: {
+      branchId,
+      code: { equals: code, mode: 'insensitive' },
+      ...(tenantId ? { tenantId } : {}),
+      ...(exceptId ? { NOT: { id: exceptId } } : {}),
+    },
   });
   if (clash) throw conflict('SERVICE_CODE_TAKEN', `Service code '${code}' is already registered in this branch.`);
 };
 
 export const createService = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot create services for another branch.');
   return prisma.$transaction(async (tx) => {
-    await assertActiveBranch(tx, branchId);
+    await assertActiveBranch(tx, branchId, actor);
     const code = input.code && !/^(?:SRV|SVR)-\d+$/i.test(input.code.trim()) ? input.code.trim().toUpperCase() : await generateNextServiceCode(tx);
-    await assertServiceCodeFree(tx, branchId, code);
-    const specificTaxRuleId = await assertTaxRule(tx, branchId, input.taxTreatment, input.specificTaxRuleId);
+    await assertServiceCodeFree(tx, branchId, code, null, actor.tenantId);
+    const specificTaxRuleId = await assertTaxRule(tx, branchId, input.taxTreatment, input.specificTaxRuleId, actor);
 
     const s = await tx.service.create({
       data: {
+        tenantId:        actor.tenantId,
         branchId,
-        categoryId:      await categoryIdFor(tx, branchId, input.category),
+        categoryId:      await categoryIdFor(tx, branchId, input.category, actor),
         code,
         name:            input.name,
         description:     input.description || null,
@@ -131,23 +197,25 @@ export const createService = async (input, actor) => {
 };
 
 export const updateService = async (id, input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   return prisma.$transaction(async (tx) => {
     const before = await tx.service.findUnique({ where: { id }, include: serviceInclude });
     if (!before) throw notFound('SERVICE_NOT_FOUND', `Service '${id}' not found.`);
+    assertTenantAccess(actor, before, 'Access Denied: Service belongs to another salon company.');
     assertBranchAccess(actor, before.branchId, 'Access Denied: Cannot edit service from another branch.');
-    await assertActiveBranch(tx, before.branchId);
+    await assertActiveBranch(tx, before.branchId, actor);
 
-    if (input.code) await assertServiceCodeFree(tx, before.branchId, input.code, id);
+    if (input.code) await assertServiceCodeFree(tx, before.branchId, input.code, id, actor.tenantId);
     const taxTreatment = input.taxTreatment ?? before.taxTreatment;
     const ruleId = input.specificTaxRuleId !== undefined ? input.specificTaxRuleId : before.specificTaxRuleId;
-    const specificTaxRuleId = await assertTaxRule(tx, before.branchId, taxTreatment, ruleId);
+    const specificTaxRuleId = await assertTaxRule(tx, before.branchId, taxTreatment, ruleId, actor);
 
     const data = { taxTreatment, specificTaxRuleId };
     for (const f of ['code', 'name', 'durationMinutes']) if (input[f] !== undefined) data[f] = input[f];
     if (input.price !== undefined) data.price = round2(input.price);
     if (input.description !== undefined) data.description = input.description || null;
     if (input.isActive !== undefined) data.isActive = input.isActive;
-    if (input.category) data.categoryId = await categoryIdFor(tx, before.branchId, input.category);
+    if (input.category) data.categoryId = await categoryIdFor(tx, before.branchId, input.category, actor);
 
     const s = await tx.service.update({ where: { id }, data, include: serviceInclude });
     await audit(tx, actor, 'SERVICE_UPDATED', 'Service', id, s.branchId, before, s);
@@ -156,21 +224,31 @@ export const updateService = async (id, input, actor) => {
 };
 
 export const toggleService = async (id, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const s = await prisma.service.findUnique({ where: { id } });
   if (!s) throw notFound('SERVICE_NOT_FOUND', `Service '${id}' not found.`);
+  assertTenantAccess(actor, s, 'Access Denied: Service belongs to another salon company.');
+  assertBranchAccess(actor, s.branchId, 'Access Denied: Cannot edit service from another branch.');
   return updateService(id, { isActive: !s.isActive }, actor);
 };
 
 // ═══ PACKAGES ═════════════════════════════════════════════════════════════════
 
-/** Validates components (same branch, active services, weights total exactly 100%). */
-const validateComponents = async (tx, branchId, components) => {
+/** Validates components (same branch, same tenant, active services, weights total exactly 100%). */
+const validateComponents = async (tx, branchId, components, tenantId) => {
   const services = await tx.service.findMany({ where: { id: { in: components.map((c) => c.serviceId) } } });
   for (const c of components) {
     const srv = services.find((s) => s.id === c.serviceId);
     if (!srv) throw badRequest('COMPONENT_NOT_FOUND', `Component service '${c.serviceName || c.serviceId}' not found.`);
-    if (srv.branchId !== branchId) throw badRequest('COMPONENT_BRANCH', `Component service '${srv.name}' belongs to a different branch.`);
-    if (!srv.isActive) throw badRequest('COMPONENT_INACTIVE', `Cannot include deactivated service '${srv.name}' in package.`);
+    if (srv.tenantId && tenantId && srv.tenantId !== tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', `Component service '${srv.name}' belongs to another salon company.`);
+    }
+    if (srv.branchId !== branchId) {
+      throw badRequest('COMPONENT_BRANCH', `Component service '${srv.name}' belongs to a different branch.`);
+    }
+    if (!srv.isActive) {
+      throw badRequest('COMPONENT_INACTIVE', `Cannot include deactivated service '${srv.name}' in package.`);
+    }
   }
   const hasAllocations = components.some((c) => c.allocationPercentage !== undefined && c.allocationPercentage !== null);
   if (hasAllocations) {
@@ -183,14 +261,19 @@ const validateComponents = async (tx, branchId, components) => {
 
 const generateNextPackageCode = async (tx) => nextSequence(tx, '', 'PKG');
 
-const assertPackageCodeFree = async (tx, branchId, code, exceptId) => {
+const assertPackageCodeFree = async (tx, branchId, code, exceptId, tenantId) => {
   const clash = await tx.package.findFirst({
-    where: { branchId, code: { equals: code, mode: 'insensitive' }, ...(exceptId ? { NOT: { id: exceptId } } : {}) },
+    where: {
+      branchId,
+      code: { equals: code, mode: 'insensitive' },
+      ...(tenantId ? { tenantId } : {}),
+      ...(exceptId ? { NOT: { id: exceptId } } : {}),
+    },
   });
   if (clash) throw conflict('PACKAGE_CODE_TAKEN', `Package code '${code}' is already registered in this branch.`);
 };
 
-const componentRows = (components) => {
+const componentRows = (components, tenantId) => {
   const n = components.length;
   const hasValid = components.every((c) => c.allocationPercentage !== undefined && c.allocationPercentage !== null);
   const sumValid = hasValid ? components.reduce((s, c) => s.plus(round2(c.allocationPercentage)), toDec(0)) : toDec(0);
@@ -210,6 +293,7 @@ const componentRows = (components) => {
       accumulated = accumulated.plus(base);
     }
     return {
+      ...(tenantId ? { tenantId } : {}),
       serviceId: c.serviceId,
       quantity: c.quantity ?? 1,
       allocationPercentage: alloc,
@@ -218,30 +302,49 @@ const componentRows = (components) => {
   });
 };
 
-export const listPackages = async (actor, branchId) => {
-  const b = resolveReadBranch(actor, branchId);
-  const pkgs = await prisma.package.findMany({ where: b ? { branchId: b } : {}, include: packageInclude, orderBy: { code: 'asc' } });
+export const listPackages = async (actor, requestedBranchId) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  const b = resolveReadBranch(actor, requestedBranchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view packages from another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+  const pkgs = await prisma.package.findMany({
+    where: {
+      tenantId: actor.tenantId,
+      ...(b ? { branchId: b } : {}),
+    },
+    include: packageInclude,
+    orderBy: { code: 'asc' },
+  });
   return pkgs.map(toPackageDTO);
 };
 
 export const getPackage = async (actor, id) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const p = await prisma.package.findUnique({ where: { id }, include: packageInclude });
   if (!p) return null;
+  assertTenantAccess(actor, p, 'Access Denied: Package belongs to another salon company.');
   assertBranchAccess(actor, p.branchId, 'Access Denied: Cannot view package from another branch.');
   return toPackageDTO(p);
 };
 
 export const createPackage = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot create packages for another branch.');
   return prisma.$transaction(async (tx) => {
-    await assertActiveBranch(tx, branchId);
+    await assertActiveBranch(tx, branchId, actor);
     const code = input.code && !/^(?:PKG)-\d+$/i.test(input.code.trim()) ? input.code.trim().toUpperCase() : await generateNextPackageCode(tx);
-    await assertPackageCodeFree(tx, branchId, code);
-    await validateComponents(tx, branchId, input.components);
-    const specificTaxRuleId = await assertTaxRule(tx, branchId, input.taxTreatment, input.specificTaxRuleId);
+    await assertPackageCodeFree(tx, branchId, code, null, actor.tenantId);
+    await validateComponents(tx, branchId, input.components, actor.tenantId);
+    const specificTaxRuleId = await assertTaxRule(tx, branchId, input.taxTreatment, input.specificTaxRuleId, actor);
 
     const p = await tx.package.create({
       data: {
+        tenantId:     actor.tenantId,
         branchId,
         code,
         name:         input.name,
@@ -250,7 +353,7 @@ export const createPackage = async (input, actor) => {
         taxTreatment: input.taxTreatment,
         specificTaxRuleId,
         isActive:     input.isActive ?? true,
-        components:   { create: componentRows(input.components) },
+        components:   { create: componentRows(input.components, actor.tenantId) },
       },
       include: packageInclude,
     });
@@ -260,23 +363,25 @@ export const createPackage = async (input, actor) => {
 };
 
 export const updatePackage = async (id, input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   return prisma.$transaction(async (tx) => {
     const before = await tx.package.findUnique({ where: { id }, include: packageInclude });
     if (!before) throw notFound('PACKAGE_NOT_FOUND', `Package '${id}' not found.`);
+    assertTenantAccess(actor, before, 'Access Denied: Package belongs to another salon company.');
     assertBranchAccess(actor, before.branchId, 'Access Denied: Cannot edit package from another branch.');
-    await assertActiveBranch(tx, before.branchId);
+    await assertActiveBranch(tx, before.branchId, actor);
 
-    if (input.code) await assertPackageCodeFree(tx, before.branchId, input.code, id);
+    if (input.code) await assertPackageCodeFree(tx, before.branchId, input.code, id, actor.tenantId);
     const taxTreatment = input.taxTreatment ?? before.taxTreatment;
     const ruleId = input.specificTaxRuleId !== undefined ? input.specificTaxRuleId : before.specificTaxRuleId;
-    const specificTaxRuleId = await assertTaxRule(tx, before.branchId, taxTreatment, ruleId);
+    const specificTaxRuleId = await assertTaxRule(tx, before.branchId, taxTreatment, ruleId, actor);
 
     const isActive = input.isActive ?? before.isActive;
     const components = input.components ?? before.components.map((c) => ({
       serviceId: c.serviceId, quantity: c.quantity, allocationPercentage: toDec(c.allocationPercentage).toNumber(),
     }));
     // Active packages must always be sellable (valid, active components totalling 100%).
-    if (input.components || (isActive && !before.isActive)) await validateComponents(tx, before.branchId, components);
+    if (input.components || (isActive && !before.isActive)) await validateComponents(tx, before.branchId, components, actor.tenantId);
 
     const data = { taxTreatment, specificTaxRuleId, isActive };
     for (const f of ['code', 'name']) if (input[f] !== undefined) data[f] = input[f];
@@ -284,7 +389,7 @@ export const updatePackage = async (id, input, actor) => {
     if (input.description !== undefined) data.description = input.description || null;
     if (input.components) {
       await tx.packageComponent.deleteMany({ where: { packageId: id } });
-      data.components = { create: componentRows(input.components) };
+      data.components = { create: componentRows(input.components, actor.tenantId) };
     }
 
     const p = await tx.package.update({ where: { id }, data, include: packageInclude });
@@ -294,21 +399,25 @@ export const updatePackage = async (id, input, actor) => {
 };
 
 export const togglePackage = async (id, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const p = await prisma.package.findUnique({ where: { id } });
   if (!p) throw notFound('PACKAGE_NOT_FOUND', `Package '${id}' not found.`);
+  assertTenantAccess(actor, p, 'Access Denied: Package belongs to another salon company.');
+  assertBranchAccess(actor, p.branchId, 'Access Denied: Cannot edit package from another branch.');
   return updatePackage(id, { isActive: !p.isActive }, actor);
 };
 
 export const bulkImportServices = async ({ branchId: requested, rows }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot import services for another branch.');
   return prisma.$transaction(async (tx) => {
-    await assertActiveBranch(tx, branchId);
+    await assertActiveBranch(tx, branchId, actor);
     let accepted = 0;
     let duplicates = 0;
     let rejected = 0;
     const details = [];
 
-    const existing = await tx.service.findMany({ where: { branchId } });
+    const existing = await tx.service.findMany({ where: { branchId, tenantId: actor.tenantId } });
     const seenCodes = new Set(existing.map((s) => s.code.toUpperCase()));
 
     for (let i = 0; i < rows.length; i++) {
@@ -343,11 +452,12 @@ export const bulkImportServices = async ({ branchId: requested, rows }, actor) =
 
         const duration = row.durationMinutes ? Math.round(Number(row.durationMinutes)) : 30;
         const taxTreatment = row.taxTreatment || 'BRANCH_DEFAULT';
-        const specificTaxRuleId = await assertTaxRule(tx, branchId, taxTreatment, row.specificTaxRuleId);
-        const categoryId = await categoryIdFor(tx, branchId, row.category || 'General');
+        const specificTaxRuleId = await assertTaxRule(tx, branchId, taxTreatment, row.specificTaxRuleId, actor);
+        const categoryId = await categoryIdFor(tx, branchId, row.category || 'General', actor);
 
         const s = await tx.service.create({
           data: {
+            tenantId: actor.tenantId,
             branchId,
             categoryId,
             code,
@@ -371,6 +481,7 @@ export const bulkImportServices = async ({ branchId: requested, rows }, actor) =
     }
 
     await auditLog(tx, {
+      tenantId: actor.tenantId,
       userId: actor.id,
       userName: actor.name,
       action: 'SERVICES_BULK_IMPORTED',
@@ -388,20 +499,21 @@ export const bulkImportServices = async ({ branchId: requested, rows }, actor) =
 };
 
 export const bulkImportPackages = async ({ branchId: requested, rows }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot import packages for another branch.');
   return prisma.$transaction(async (tx) => {
-    await assertActiveBranch(tx, branchId);
+    await assertActiveBranch(tx, branchId, actor);
     let accepted = 0;
     let duplicates = 0;
     let rejected = 0;
     const details = [];
 
-    const branchServices = await tx.service.findMany({ where: { branchId } });
+    const branchServices = await tx.service.findMany({ where: { branchId, tenantId: actor.tenantId } });
     const serviceById = new Map(branchServices.map((s) => [s.id, s]));
     const serviceByCode = new Map(branchServices.map((s) => [s.code.toUpperCase(), s]));
     const serviceByName = new Map(branchServices.map((s) => [s.name.trim().toLowerCase(), s]));
 
-    const existingPkgs = await tx.package.findMany({ where: { branchId } });
+    const existingPkgs = await tx.package.findMany({ where: { branchId, tenantId: actor.tenantId } });
     const seenCodes = new Set(existingPkgs.map((p) => p.code.toUpperCase()));
 
     for (let i = 0; i < rows.length; i++) {
@@ -492,9 +604,10 @@ export const bulkImportPackages = async ({ branchId: requested, rows }, actor) =
               break;
             }
             const sCode = await generateNextServiceCode(tx);
-            const defaultCategoryId = await categoryIdFor(tx, branchId, 'General');
+            const defaultCategoryId = await categoryIdFor(tx, branchId, 'General', actor);
             srv = await tx.service.create({
               data: {
+                tenantId: actor.tenantId,
                 branchId,
                 categoryId: defaultCategoryId,
                 code: sCode,
@@ -531,12 +644,13 @@ export const bulkImportPackages = async ({ branchId: requested, rows }, actor) =
           continue;
         }
 
-        await validateComponents(tx, branchId, resolvedComponents);
+        await validateComponents(tx, branchId, resolvedComponents, actor.tenantId);
         const taxTreatment = row.taxTreatment || 'BRANCH_DEFAULT';
-        const specificTaxRuleId = await assertTaxRule(tx, branchId, taxTreatment, row.specificTaxRuleId);
+        const specificTaxRuleId = await assertTaxRule(tx, branchId, taxTreatment, row.specificTaxRuleId, actor);
 
         const p = await tx.package.create({
           data: {
+            tenantId: actor.tenantId,
             branchId,
             code,
             name,
@@ -545,7 +659,7 @@ export const bulkImportPackages = async ({ branchId: requested, rows }, actor) =
             taxTreatment,
             specificTaxRuleId,
             isActive: row.isActive !== false,
-            components: { create: componentRows(resolvedComponents) },
+            components: { create: componentRows(resolvedComponents, actor.tenantId) },
           },
           include: packageInclude,
         });
@@ -559,6 +673,7 @@ export const bulkImportPackages = async ({ branchId: requested, rows }, actor) =
     }
 
     await auditLog(tx, {
+      tenantId: actor.tenantId,
       userId: actor.id,
       userName: actor.name,
       action: 'PACKAGES_BULK_IMPORTED',
@@ -574,4 +689,3 @@ export const bulkImportPackages = async ({ branchId: requested, rows }, actor) =
     timeout: 60000,
   });
 };
-

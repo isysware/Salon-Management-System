@@ -2,6 +2,7 @@
 
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { authorize } from '../../middleware/authorize.js';
 import { validate } from '../../middleware/validate.js';
 import { createStaffSchema, updateStaffSchema, portalAccessSchema, listStaffQuery } from './staff.schema.js';
@@ -10,7 +11,7 @@ import * as c from './staff.controller.js';
 const ADMINS = ['SUPER_ADMIN', 'ADMIN'];
 
 const router = Router();
-router.use(authenticate);
+router.use(authenticate, tenantContext);
 
 router.get('/',          authorize(...ADMINS, 'ACCOUNTANT'), validate(listStaffQuery, 'query'), c.list);
 router.get('/next-code', authorize(...ADMINS), c.nextCode);

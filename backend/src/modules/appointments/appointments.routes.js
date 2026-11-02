@@ -2,6 +2,7 @@
 
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { authorize } from '../../middleware/authorize.js';
 import { validate } from '../../middleware/validate.js';
 import * as v from './appointments.schema.js';
@@ -10,7 +11,7 @@ import * as c from './appointments.controller.js';
 const ADMINS = ['SUPER_ADMIN', 'ADMIN'];
 
 const router = Router();
-router.use(authenticate);
+router.use(authenticate, tenantContext);
 
 router.get('/',       authorize(...ADMINS), validate(v.listQuery, 'query'), c.list);
 router.get('/queue',  authorize(...ADMINS, 'ACCOUNTANT'), validate(v.queueQuery, 'query'), c.queue);

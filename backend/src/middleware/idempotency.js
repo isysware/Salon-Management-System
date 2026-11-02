@@ -13,8 +13,25 @@ export const idempotency = asyncHandler(async (req, res, next) => {
   if (!rawKey) {
     throw new AppError(400, 'MISSING_IDEMPOTENCY_KEY', 'Idempotency-Key header is required for this operation');
   }
-  // Scope keys per user so two users can never collide on the same key.
-  const key = `${req.user.id}:${rawKey}`;
+
+  // Resolve tenant context
+  const tenantId = req.tenantId || req.user?.tenantId;
+
+  // Explicit Fail-Closed: If the route is marked as tenant-required or tenant context is expected,
+  // request must have a verified tenant context. An operational route can NEVER fall back to 'global'.
+  if (req.tenantRequired && !tenantId) {
+    throw new AppError(403, 'TENANT_REQUIRED', 'Access Denied: Verified tenant context is required for this operation.');
+  }
+
+  // Determine partition key: tenant-scoped if tenant context exists or is required, otherwise global
+  const isTenantScoped = Boolean(req.tenantRequired || tenantId);
+  const partition = isTenantScoped ? tenantId : 'global';
+
+  if (isTenantScoped && !partition) {
+    throw new AppError(403, 'TENANT_REQUIRED', 'Access Denied: Verified tenant context is required for this operation.');
+  }
+
+  const key = `${partition}:${req.user?.id || 'anonymous'}:${rawKey}`;
   req.idempotencyKey = String(rawKey);
   req.paymentRequestHash = paymentRequestHash(req.body);
 

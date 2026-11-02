@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import prisma from '../../config/prisma.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { auditLog } from '../../lib/audit.js';
 import { dateOnly, getBusinessDate, toTimeString, ymd } from '../../lib/dates.js';
 import { round2, toDec } from '../../lib/money.js';
@@ -19,9 +19,11 @@ const admin = actor => { if (!['ADMIN', 'SUPER_ADMIN'].includes(actor.role)) thr
 const reader = actor => { if (!['ADMIN', 'SUPER_ADMIN', 'ACCOUNTANT'].includes(actor.role)) throw forbidden('FORBIDDEN', 'Booking access denied.'); };
 export const loadBooking = async (tx, actor, id, { lock = false, editable = false } = {}) => {
   reader(actor);
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (lock) await tx.$executeRaw`SELECT 1 FROM "Booking" WHERE id = ${id} FOR UPDATE`;
   const b = await tx.booking.findUnique({ where: { id }, include: bookingInclude });
   if (!b) throw notFound('BOOKING_NOT_FOUND', 'Booking not found.');
+  assertTenantAccess(actor, b, 'Access Denied: Booking belongs to another salon company.');
   assertBranchAccess(actor, b.branchId);
   if (editable && (b.invoice || ['COMPLETED', 'CANCELLED', 'NO_SHOW'].includes(b.status))) throw conflict('BOOKING_CLOSED', 'This booking is closed or already invoiced.');
   return b;
@@ -91,23 +93,34 @@ export const buildBookingItems = async (tx, branch, input, previous = []) => {
   return { items, durationMinutes: pointer - start, endTime: time(pointer), assignedStaffId: lead?.id || null, assignedStaffName: lead?.name || null };
 };
 
-const createItems = items => items.map(i => ({ ...i, components: json(i.components) }));
+const createItems = (items, tenantId) => items.map(i => ({ ...i, ...(tenantId ? { tenantId } : {}), components: json(i.components) }));
 const branchForWrite = async (tx, branchId) => {
   const b = await tx.branch.findUnique({ where: { id: branchId } });
   if (!b?.isActive) throw badRequest('BRANCH_INACTIVE', 'Select an active branch.');
   return b;
 };
 export const createBooking = (input, actor, request) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   admin(actor);
   const branchId = resolveWriteBranch(actor, input.branchId);
   return paymentPosting(actor, request, async tx => {
     const branch = await branchForWrite(tx, branchId);
+    assertTenantAccess(actor, branch, 'Access Denied: Branch belongs to another salon company.');
+    if (input.clientId) {
+      const clientCheck = await tx.client.findUnique({ where: { id: input.clientId } });
+      if (!clientCheck || clientCheck.branchId !== branchId || (clientCheck.tenantId && clientCheck.tenantId !== actor.tenantId)) {
+        throw badRequest('CLIENT_NOT_FOUND', `Client '${input.clientId}' is invalid for this salon branch.`);
+      }
+    }
     const plan = await buildBookingItems(tx, branch, input);
     const client = await findOrCreateClient(tx, { branchId, clientId: input.clientId, name: input.clientName, phone: input.clientPhone });
-    const b = await tx.booking.create({ data: { bookingNumber: await nextSequence(tx, branch.code, 'BKG'), branchId, clientId: client.id, clientName: client.name, clientPhone: client.phone,
+    const b = await tx.booking.create({ data: {
+      tenantId: actor.tenantId,
+      bookingNumber: await nextSequence(tx, branch.code, 'BKG'), branchId, clientId: client.id, clientName: client.name, clientPhone: client.phone,
       type: input.type, eventDate: dateOnly(input.eventDate), serviceTime: time(minutes(input.serviceTime)), endTime: plan.endTime, durationMinutes: plan.durationMinutes,
       assignedStaffId: plan.assignedStaffId, assignedStaffName: plan.assignedStaffName, notes: input.notes, specialRequirements: input.specialRequirements,
-      ...priceBooking(plan.items, input.discountType, input.discountValue), createdById: actor.id, createdByName: actor.name, items: { create: createItems(plan.items) } }, include: bookingInclude });
+      ...priceBooking(plan.items, input.discountType, input.discountValue), createdById: actor.id, createdByName: actor.name,
+      items: { create: createItems(plan.items, actor.tenantId) } }, include: bookingInclude });
     await bookingHistory(tx, b, actor, 'BOOKING_CREATED', null, { totalAmount: Number(b.totalAmount), date: await getBusinessDate(tx), items: plan.items });
     if (input.advancePayment) await recordPaymentInTx(tx, b, input.advancePayment, actor);
     return toBookingDTO(await loadBooking(tx, actor, b.id));
@@ -118,14 +131,14 @@ export const reviseBooking = async (tx, b, input, actor) => {
   if (input.branchId && input.branchId !== b.branchId) throw badRequest('BOOKING_BRANCH', 'A booking cannot move between branches.');
   if (input.clientId && input.clientId !== b.clientId) throw badRequest('BOOKING_CLIENT', 'A saved booking cannot be transferred to another client.');
   const branch = await branchForWrite(tx, b.branchId);
-  const plan = await buildBookingItems(tx, branch, { ...input, excludeBookingId: b.id }, b.items);
+  const plan = await buildBookingItems(tx, branch, { ...input, excludeBookingId: b.id }, b.items, actor);
   const prices = priceBooking(plan.items, input.discountType, input.discountValue);
   if (prices.totalAmount.lessThan(netPayments(b.payments))) throw conflict('REFUND_EXCESS_FIRST', 'Refund excess advance before reducing the booking below the amount received.');
   await tx.bookingItem.deleteMany({ where: { bookingId: b.id } });
   await tx.booking.update({ where: { id: b.id }, data: { type: input.type, eventDate: dateOnly(input.eventDate), serviceTime: time(minutes(input.serviceTime)),
     endTime: plan.endTime, durationMinutes: plan.durationMinutes, assignedStaffId: plan.assignedStaffId, assignedStaffName: plan.assignedStaffName,
     notes: input.notes, specialRequirements: input.specialRequirements, ...prices, revision: { increment: 1 }, updatedById: actor.id, updatedByName: actor.name,
-    items: { create: createItems(plan.items) } } });
+    items: { create: createItems(plan.items, actor.tenantId) } } });
   await bookingHistory(tx, b, actor, 'BOOKING_REVISED', { totalAmount: Number(b.totalAmount), eventDate: ymd(b.eventDate), serviceTime: b.serviceTime, items: b.items }, { totalAmount: Number(prices.totalAmount), date: await getBusinessDate(tx), eventDate: input.eventDate, serviceTime: input.serviceTime, items: plan.items }, input.reason);
   return loadBooking(tx, actor, b.id);
 };
@@ -133,8 +146,10 @@ export const updateBooking = (id, input, actor) => { admin(actor); return prisma
 export const getBooking = async (actor, id) => toBookingDTO(await loadBooking(prisma, actor, id));
 export const listBookings = async (actor, q = {}) => {
   reader(actor);
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveReadBranch(actor, q.branchId);
-  const rows = await prisma.booking.findMany({ where: { ...(branchId ? { branchId } : {}), ...(q.clientId ? { clientId: q.clientId } : {}), ...(q.type ? { type: q.type } : {}), ...(q.status ? { status: q.status } : {}),
+  const rows = await prisma.booking.findMany({ where: {
+    tenantId: actor.tenantId, ...(branchId ? { branchId } : {}), ...(q.clientId ? { clientId: q.clientId } : {}), ...(q.type ? { type: q.type } : {}), ...(q.status ? { status: q.status } : {}),
     ...(q.startDate || q.endDate ? { eventDate: { ...(q.startDate ? { gte: dateOnly(q.startDate) } : {}), ...(q.endDate ? { lte: dateOnly(q.endDate) } : {}) } } : {}),
     ...(q.search ? { OR: [{ clientName: { contains: q.search, mode: 'insensitive' } }, { clientPhone: { contains: q.search } }, { bookingNumber: { contains: q.search, mode: 'insensitive' } }] } : {}) }, include: bookingInclude, orderBy: [{ eventDate: 'asc' }, { createdAt: 'asc' }] });
   return rows.map(toBookingDTO).filter(b => !q.paymentStatus || b.paymentStatus === q.paymentStatus);
@@ -158,10 +173,16 @@ export const recordPaymentInTx = async (tx, b, input, actor, isRefund = false) =
     drawerId = drawer.id;
     movement = await postCashMovement(tx, { ...common, holderId: drawerId });
   } else {
+    if (input.paymentAccountId) {
+      const acc = await tx.paymentAccount.findUnique({ where: { id: input.paymentAccountId } });
+      if (!acc || (acc.tenantId && acc.tenantId !== actor.tenantId)) {
+        throw badRequest('ACCOUNT_INVALID', 'Payment account is invalid or belongs to another salon company.');
+      }
+    }
     const posted = await postAccountMovement(tx, { ...common, accountId: input.paymentAccountId, branchId: b.branchId });
     movement = posted.movement; paymentAccountName = posted.account.name;
   }
-  const p = await tx.bookingPayment.create({ data: { id: paymentId, receiptNumber, bookingId: b.id, branchId: b.branchId, isRefund, amount, date: dateOnly(date), time: toTimeString(), method: input.method,
+  const p = await tx.bookingPayment.create({ data: { id: paymentId, tenantId: actor.tenantId, receiptNumber, bookingId: b.id, branchId: b.branchId, isRefund, amount, date: dateOnly(date), time: toTimeString(), method: input.method,
     paymentAccountId: input.method === 'ONLINE_ACCOUNT' ? input.paymentAccountId : null, paymentAccountName, drawerId, movementId: movement.id,
     reference: input.reference, notes: input.notes, processedByUserId: actor.id, processedByName: actor.name } });
   await tx.booking.update({ where: { id: b.id }, data: { revision: { increment: 1 } } });
@@ -220,8 +241,10 @@ export const getHandoff = async (actor, id) => toBookingDTO(await loadBooking(pr
 
 export const getCollections = async (actor, q = {}) => {
   reader(actor);
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveReadBranch(actor, q.branchId);
   const rows = await prisma.bookingPayment.findMany({ where: {
+    tenantId: actor.tenantId,
     ...(branchId ? { branchId } : {}),
     ...(q.startDate || q.endDate ? { date: { ...(q.startDate ? { gte: dateOnly(q.startDate) } : {}), ...(q.endDate ? { lte: dateOnly(q.endDate) } : {}) } } : {}),
     booking: { ...(q.type ? { type: q.type } : {}), ...(q.status ? { status: q.status } : {}), ...(q.clientId ? { clientId: q.clientId } : {}),

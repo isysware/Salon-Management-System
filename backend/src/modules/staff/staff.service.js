@@ -1,11 +1,11 @@
-import { nextSequence } from '../../lib/sequence.js';
 // src/modules/staff/staff.service.js
 // Staff directory: profiles, compensation (with history), schedules and portal access.
 
+import { nextSequence } from '../../lib/sequence.js';
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { dateOnly, getBusinessDate, ymd } from '../../lib/dates.js';
 import { toDec } from '../../lib/money.js';
 import { hashPassword } from '../auth/auth.service.js';
@@ -75,8 +75,22 @@ const assertEmailFreeForLogin = async (tx, identifier, exceptUserId) => {
 // ── Queries ──────────────────────────────────────────────────────────────────
 
 export const listStaff = async (actor, { branchId, active, search } = {}) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId, 'Access Denied: Cannot view staff of another branch.');
+  }
+
   const b = resolveReadBranch(actor, branchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view staff of another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
   const where = {
+    tenantId: actor.tenantId,
     ...(b ? { branchId: b } : {}),
     ...(active ? { isActive: active === 'true' } : {}),
     ...(search ? {
@@ -93,8 +107,10 @@ export const listStaff = async (actor, { branchId, active, search } = {}) => {
 };
 
 export const getStaff = async (actor, id) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const staff = await prisma.staff.findUnique({ where: { id }, include });
   if (!staff) return null;
+  assertTenantAccess(actor, staff);
   if (actor.role === 'STAFF' && actor.staffId !== id) throw forbidden('FORBIDDEN', 'Access Denied: You can only view your own profile.');
   assertBranchAccess(actor, staff.branchId, 'Access Denied: Cannot view employee from another branch.');
   return toStaffDTO(staff, { redactPay: actor.role === 'ACCOUNTANT' });
@@ -111,11 +127,26 @@ export const getBranchNumber = async (tx, branchId) => {
 };
 
 export const peekNextEmployeeCode = async (actor, branchId) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId, 'Access Denied: Cannot view employee code for another branch.');
+  }
   const targetBranch = resolveReadBranch(actor, branchId);
+  if (targetBranch) {
+    assertBranchAccess(actor, targetBranch, 'Access Denied: Cannot view employee code for another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: targetBranch } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
   const branchNum = await getBranchNumber(prisma, targetBranch);
   const prefix = `EMP${branchNum}`;
   const existingStaff = await prisma.staff.findMany({
-    where: { employeeCode: { startsWith: `${prefix}-`, mode: 'insensitive' } },
+    where: {
+      tenantId: actor.tenantId,
+      ...(targetBranch ? { branchId: targetBranch } : {}),
+      employeeCode: { startsWith: `${prefix}-`, mode: 'insensitive' },
+    },
     select: { employeeCode: true },
   });
   let maxNum = 0;
@@ -138,20 +169,30 @@ export const generateNextEmployeeCode = async (tx, branchId) => {
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 export const createStaff = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot add staff to another branch.');
 
   return prisma.$transaction(async (tx) => {
     const branch = await tx.branch.findUnique({ where: { id: branchId } });
-    if (!branch || !branch.isActive) throw badRequest('BRANCH_INACTIVE', 'Cannot add staff to an inactive or non-existent branch.');
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+    if (!branch.isActive) throw badRequest('BRANCH_INACTIVE', 'Cannot add staff to an inactive or non-existent branch.');
 
     const isAutoPlaceholder = !input.employeeCode || /^EMP\d*-\d+$/i.test(input.employeeCode.trim());
     const employeeCode = isAutoPlaceholder
       ? await generateNextEmployeeCode(tx, branchId)
       : input.employeeCode.trim().toUpperCase();
 
-    // Employee codes are unique across the whole company (biometric devices map by code).
-    const clash = await tx.staff.findFirst({ where: { employeeCode: { equals: employeeCode, mode: 'insensitive' } } });
-    if (clash) throw conflict('EMPLOYEE_CODE_TAKEN', `Employee code '${employeeCode}' is already assigned to another staff member.`);
+    // Check code uniqueness within this branch and tenant
+    const clash = await tx.staff.findFirst({
+      where: {
+        branchId,
+        tenantId: actor.tenantId,
+        employeeCode: { equals: employeeCode, mode: 'insensitive' },
+      },
+    });
+    if (clash) throw conflict('EMPLOYEE_CODE_TAKEN', `Employee code '${employeeCode}' is already assigned to another staff member in this branch.`);
 
     const today = await getBusinessDate(tx);
     const comp = normalizeCompensation({
@@ -169,6 +210,7 @@ export const createStaff = async (input, actor) => {
     let staff = await tx.staff.create({
       data: {
         ...comp,
+        tenantId:             actor.tenantId,
         employeeCode,
         branchId,
         name:                 input.name,
@@ -204,6 +246,14 @@ export const createStaff = async (input, actor) => {
         },
         include: { branch: { select: { name: true } } },
       });
+      await tx.tenantMembership.create({
+        data: {
+          tenantId: actor.tenantId,
+          userId: user.id,
+          role: 'STAFF',
+          status: 'ACTIVE',
+        },
+      });
       staff = await tx.staff.update({ where: { id: staff.id }, data: { hasPortalAccess: true }, include });
     }
 
@@ -216,8 +266,10 @@ export const createStaff = async (input, actor) => {
 };
 
 export const updateStaff = async (id, input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   return prisma.$transaction(async (tx) => {
     const before = await getOrThrow(tx, id);
+    assertTenantAccess(actor, before);
     assertBranchAccess(actor, before.branchId, 'Access Denied: Cannot edit employee from another branch.');
     if (input.branchId && input.branchId !== before.branchId) {
       throw badRequest('TRANSFER_NOT_SUPPORTED', 'Employee branch transfers require an explicit operational transfer workflow.');
@@ -242,8 +294,11 @@ export const updateStaff = async (id, input, actor) => {
     if (payChanged) {
       await tx.staffCompensationHistory.create({
         data: {
-          staffId: id, snapshot: compensationSnapshot(before),
-          effectiveDate: before.effectiveDate, changedBy: actor.id,
+          tenantId: actor.tenantId,
+          staffId: id,
+          snapshot: compensationSnapshot(before),
+          effectiveDate: before.effectiveDate,
+          changedBy: actor.id,
         },
       });
     }
@@ -284,6 +339,10 @@ export const updateStaff = async (id, input, actor) => {
       });
       if (input.isActive === false) {
         await tx.refreshToken.updateMany({ where: { userId: staff.user.id, revokedAt: null }, data: { revokedAt: new Date() } });
+        await tx.tenantMembership.updateMany({
+          where: { tenantId: actor.tenantId, userId: staff.user.id },
+          data: { status: 'SUSPENDED' },
+        });
       }
     }
 
@@ -303,8 +362,10 @@ export const updateStaff = async (id, input, actor) => {
 };
 
 export const deactivateStaff = async (id, actor, exitDate) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const staff = await prisma.staff.findUnique({ where: { id } });
   if (!staff) throw notFound('STAFF_NOT_FOUND', `Employee '${id}' not found.`);
+  assertTenantAccess(actor, staff);
   assertBranchAccess(actor, staff.branchId, 'Access Denied: Cannot deactivate employee from another branch.');
   if (exitDate && !/^\d{4}-\d{2}-\d{2}$/.test(exitDate)) throw badRequest('INVALID_EXIT_DATE', 'Exit date must be YYYY-MM-DD.');
   await updateStaff(id, { isActive: false, exitDate }, actor);
@@ -315,60 +376,90 @@ export const deactivateStaff = async (id, actor, exitDate) => {
 };
 
 export const setPortalAccess = async (staffId, { enable, identifier, password }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   return prisma.$transaction((tx) => configurePortalAccess(tx, staffId, { enable, identifier, password }, actor));
 };
 
 const configurePortalAccess = async (tx, staffId, { enable, identifier, password }, actor) => {
-    const staff = await tx.staff.findUnique({ where: { id: staffId }, include: { ...include, user: true } });
-    if (!staff) throw notFound('STAFF_NOT_FOUND', `Staff record '${staffId}' not found.`);
-    assertBranchAccess(actor, staff.branchId, 'Access Denied: Cannot configure portal access for an employee in another branch.');
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  const staff = await tx.staff.findUnique({ where: { id: staffId }, include: { ...include, user: true } });
+  if (!staff) throw notFound('STAFF_NOT_FOUND', `Staff record '${staffId}' not found.`);
+  assertTenantAccess(actor, staff);
+  assertBranchAccess(actor, staff.branchId, 'Access Denied: Cannot configure portal access for an employee in another branch.');
 
-    let user = staff.user;
+  let user = staff.user;
 
-    if (!enable) {
-      await tx.staff.update({ where: { id: staffId }, data: { hasPortalAccess: false } });
-      if (user) {
-        user = await tx.user.update({ where: { id: user.id }, data: { isActive: false }, include: { branch: { select: { name: true } } } });
-        await tx.refreshToken.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
-      }
-    } else {
-      if (!staff.isActive) throw badRequest('STAFF_INACTIVE', 'Cannot enable portal access for an inactive employee. Re-activate employment first.');
-      const branch = await tx.branch.findUnique({ where: { id: staff.branchId } });
-      if (!branch?.isActive) throw badRequest('BRANCH_INACTIVE', 'Cannot enable portal access for an employee in an inactive branch.');
-
-      const loginId = (identifier || user?.email || staff.email)?.trim().toLowerCase();
-      if (!loginId) throw badRequest('IDENTIFIER_REQUIRED', 'A valid login identifier is required to enable portal access.');
-      await assertEmailFreeForLogin(tx, loginId, user?.id);
-
-      if (user) {
-        // Re-enable the existing account instead of creating another.
-        const data = { isActive: true, email: loginId, branchId: staff.branchId };
-        if (password) {
-          data.passwordHash = await hashPassword(password);
-          data.plainPassword = null;
-        }
-        user = await tx.user.update({ where: { id: user.id }, data, include: { branch: { select: { name: true } } } });
-        if (password) await tx.refreshToken.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
-      } else {
-        user = await tx.user.create({
-          data: {
-            name: staff.name, email: loginId, role: 'STAFF', branchId: staff.branchId, staffId: staff.id,
-            title: staff.designation, phone: staff.phone,
-            passwordHash: await hashPassword(password || DEFAULT_PORTAL_PASSWORD),
-          },
-          include: { branch: { select: { name: true } } },
-        });
-      }
-      await tx.staff.update({ where: { id: staffId }, data: { hasPortalAccess: true } });
+  if (!enable) {
+    await tx.staff.update({ where: { id: staffId }, data: { hasPortalAccess: false } });
+    if (user) {
+      user = await tx.user.update({ where: { id: user.id }, data: { isActive: false }, include: { branch: { select: { name: true } } } });
+      await tx.refreshToken.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
+      await tx.tenantMembership.updateMany({
+        where: { tenantId: actor.tenantId, userId: user.id },
+        data: { status: 'SUSPENDED' },
+      });
+    }
+  } else {
+    if (!staff.isActive) throw badRequest('STAFF_INACTIVE', 'Cannot enable portal access for an inactive employee. Re-activate employment first.');
+    const branch = await tx.branch.findUnique({ where: { id: staff.branchId } });
+    if (!branch?.isActive) throw badRequest('BRANCH_INACTIVE', 'Cannot enable portal access for an employee in an inactive branch.');
+    if (branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
     }
 
-    await auditLog(tx, {
-      userId: actor.id, userName: actor.name, action: enable ? 'STAFF_PORTAL_ENABLED' : 'STAFF_PORTAL_DISABLED',
-      entity: 'Staff', entityId: staffId, branchId: staff.branchId,
-    });
+    const loginId = (identifier || user?.email || staff.email)?.trim().toLowerCase();
+    if (!loginId) throw badRequest('IDENTIFIER_REQUIRED', 'A valid login identifier is required to enable portal access.');
+    await assertEmailFreeForLogin(tx, loginId, user?.id);
 
-    const fresh = await tx.staff.findUnique({ where: { id: staffId }, include });
-    return { staff: toStaffDTO(fresh), user: user ? toUserDTO(user) : undefined };
+    if (user) {
+      // Re-enable the existing account instead of creating another.
+      const data = { isActive: true, email: loginId, branchId: staff.branchId };
+      if (password) {
+        data.passwordHash = await hashPassword(password);
+        data.plainPassword = null;
+      }
+      user = await tx.user.update({ where: { id: user.id }, data, include: { branch: { select: { name: true } } } });
+      if (password) await tx.refreshToken.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
+      await tx.tenantMembership.upsert({
+        where: { tenantId_userId: { tenantId: actor.tenantId, userId: user.id } },
+        create: {
+          tenantId: actor.tenantId,
+          userId: user.id,
+          role: 'STAFF',
+          status: 'ACTIVE',
+        },
+        update: {
+          status: 'ACTIVE',
+        },
+      });
+    } else {
+      user = await tx.user.create({
+        data: {
+          name: staff.name, email: loginId, role: 'STAFF', branchId: staff.branchId, staffId: staff.id,
+          title: staff.designation, phone: staff.phone,
+          passwordHash: await hashPassword(password || DEFAULT_PORTAL_PASSWORD),
+        },
+        include: { branch: { select: { name: true } } },
+      });
+      await tx.tenantMembership.create({
+        data: {
+          tenantId: actor.tenantId,
+          userId: user.id,
+          role: 'STAFF',
+          status: 'ACTIVE',
+        },
+      });
+    }
+    await tx.staff.update({ where: { id: staffId }, data: { hasPortalAccess: true } });
+  }
+
+  await auditLog(tx, {
+    userId: actor.id, userName: actor.name, action: enable ? 'STAFF_PORTAL_ENABLED' : 'STAFF_PORTAL_DISABLED',
+    entity: 'Staff', entityId: staffId, branchId: staff.branchId,
+  });
+
+  const fresh = await tx.staff.findUnique({ where: { id: staffId }, include });
+  return { staff: toStaffDTO(fresh), user: user ? toUserDTO(user) : undefined };
 };
 
 const num = (v) => toDec(v ?? 0).toNumber();

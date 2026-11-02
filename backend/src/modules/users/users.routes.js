@@ -2,13 +2,14 @@
 
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { authorize } from '../../middleware/authorize.js';
 import { validate } from '../../middleware/validate.js';
 import { createUserSchema, updateUserSchema, listUsersQuery, resetPasswordSchema } from './users.schema.js';
 import * as c from './users.controller.js';
 
 const router = Router();
-router.use(authenticate, authorize('SUPER_ADMIN', 'ADMIN'));
+router.use(authenticate, tenantContext, authorize('SUPER_ADMIN', 'ADMIN'));
 
 router.get('/',                     validate(listUsersQuery, 'query'), c.list);
 router.get('/:id',                  c.getOne);

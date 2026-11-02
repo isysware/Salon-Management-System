@@ -6,7 +6,7 @@
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { getBusinessDate, dateOnly, ymd, isYmd } from '../../lib/dates.js';
 import { round2, toDec } from '../../lib/money.js';
 import { nextSequence, nextPeriodSequence } from '../../lib/sequence.js';
@@ -22,8 +22,16 @@ import { lockCommissionBranch, combinedContract, payrollCommission, assertCommis
 
 const runInclude = { payslips: { include: { payments: true } } };
 const noAccountant = (actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (actor.role === 'ACCOUNTANT') throw forbidden('FORBIDDEN', 'Access Denied: Accountants are not authorized to access confidential payroll.');
   if (actor.role === 'STAFF') throw forbidden('FORBIDDEN', 'Access Denied: Staff members cannot access payroll run management.');
+};
+
+const assertTenantBranch = async (tx, actor, branchId) => {
+  if (!branchId || branchId === 'ALL') return;
+  const branch = await tx.branch.findUnique({ where: { id: branchId }, select: { id: true, tenantId: true } });
+  if (!branch) throw notFound('BRANCH_NOT_FOUND', `Branch '${branchId}' not found.`);
+  assertTenantAccess(actor, branch);
 };
 
 export const toPaymentDTO = (p) => ({
@@ -78,8 +86,10 @@ export const toRunDTO = (run, branchName) => {
   };
 };
 
-const runDTO = async (tx, id) => {
+const runDTO = async (tx, id, actor) => {
   const run = await tx.payrollRun.findUnique({ where: { id }, include: runInclude });
+  if (!run) return null;
+  if (actor?.tenantId) assertTenantAccess(actor, run);
   const branch = await tx.branch.findUnique({ where: { id: run.branchId } });
   return toRunDTO(run, branch?.name);
 };
@@ -90,6 +100,7 @@ const runDTO = async (tx, id) => {
  * Pay terms are the ones in force on the last employed day of the period (StaffCompensationHistory).
  */
 const evaluateBranchMonth = async (tx, actor, branchId, month, staffId, options = {}) => {
+  await assertTenantBranch(tx, actor, branchId);
   const totalDays = getCalendarDaysInMonth(month);
   const defaultStart = `${month}-01`;
   const defaultEnd = `${month}-${String(totalDays).padStart(2, '0')}`;
@@ -98,6 +109,7 @@ const evaluateBranchMonth = async (tx, actor, branchId, month, staffId, options 
   const today = await getBusinessDate(tx);
   const endDate = selectedEnd > today ? today : selectedEnd;
   if (startDate > endDate) throw badRequest('FUTURE_PAYROLL', 'Payroll cannot include future salary days. Select a period on or before the business date.');
+
   const runType = options.runType || (startDate === endDate ? 'DAILY' : (startDate !== defaultStart || endDate !== defaultEnd) ? 'CUSTOM_RANGE' : 'MONTHLY');
   const compensationType = options.compensationType;
   const staffIds = options.staffIds;
@@ -110,6 +122,7 @@ const evaluateBranchMonth = async (tx, actor, branchId, month, staffId, options 
   // Load existing finalized runs to prevent duplicate salary or overtime on overlapping dates
   const finalizedRuns = await tx.payrollRun.findMany({
     where: {
+      tenantId: actor.tenantId,
       branchId,
       status: { notIn: ['DRAFT', 'CANCELLED'] },
       ...(options.excludeRunId ? { id: { not: options.excludeRunId } } : {}),
@@ -136,6 +149,7 @@ const evaluateBranchMonth = async (tx, actor, branchId, month, staffId, options 
 
   const staffRows = await tx.staff.findMany({
     where: {
+      tenantId: actor.tenantId,
       branchId,
       joiningDate: { lte: to },
       ...(staffIds && staffIds.length ? { id: { in: staffIds } } : staffId ? { id: staffId } : {}),
@@ -146,15 +160,15 @@ const evaluateBranchMonth = async (tx, actor, branchId, month, staffId, options 
   });
 
   const attendanceRows = await tx.attendanceRecord.findMany({
-    where: { branchId, workDate: { gte: from, lte: to } },
+    where: { tenantId: actor.tenantId, branchId, workDate: { gte: from, lte: to } },
     include: { punches: true, corrections: true },
   });
   const otRows = await tx.overtimeRecord.findMany({
-    where: { branchId, workDate: { gte: from, lte: to }, status: 'APPROVED', payrollRunId: null },
+    where: { tenantId: actor.tenantId, branchId, workDate: { gte: from, lte: to }, status: 'APPROVED', payrollRunId: null },
   });
-  const holidays = (await tx.branchHoliday.findMany({ where: { branchId: { in: ['ALL', branchId] } } }))
+  const holidays = (await tx.branchHoliday.findMany({ where: { tenantId: actor.tenantId, branchId: { in: ['ALL', branchId] } } }))
     .map((h) => ({ id: h.id, branchId: h.branchId, date: h.date.toISOString().slice(0, 10), title: h.title }));
-  const extras = await loadPayrollExtras(tx, branchId, month, staffRows.map((s) => s.id));
+  const extras = await loadPayrollExtras(tx, branchId, month, staffRows.map((s) => s.id), actor.tenantId);
 
   const byId = new Map(staffRows.map((s) => [s.id, s]));
   const attendance = attendanceRows.map((a) => toAttendanceDTO(a, byId.get(a.staffId)));
@@ -214,11 +228,17 @@ const evaluateBranchMonth = async (tx, actor, branchId, month, staffId, options 
 
 export const listRuns = async (actor, { branchId, month } = {}) => {
   noAccountant(actor);
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId);
+    await assertTenantBranch(prisma, actor, branchId);
+  }
   const b = resolveReadBranch(actor, branchId);
   const runs = await prisma.payrollRun.findMany({
-    where: { ...(b ? { branchId: b } : {}), ...(month ? { month } : {}) }, include: runInclude, orderBy: [{ month: 'desc' }, { generatedAt: 'desc' }],
+    where: { tenantId: actor.tenantId, ...(b ? { branchId: b } : {}), ...(month ? { month } : {}) },
+    include: runInclude,
+    orderBy: [{ month: 'desc' }, { generatedAt: 'desc' }],
   });
-  const branches = new Map((await prisma.branch.findMany()).map((x) => [x.id, x.name]));
+  const branches = new Map((await prisma.branch.findMany({ where: { tenantId: actor.tenantId } })).map((x) => [x.id, x.name]));
   return runs.map((r) => toRunDTO(r, branches.get(r.branchId)));
 };
 
@@ -228,6 +248,7 @@ export const generatePreview = async (actor, { branchId: requested, month: reqMo
   noAccountant(actor);
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot generate payroll for another branch.');
   return prisma.$transaction(async (tx) => {
+    await assertTenantBranch(tx, actor, branchId);
     await lockCommissionBranch(tx, branchId);
     const today = await getBusinessDate(tx);
     const month = reqMonth || (startDate ? startDate.slice(0, 7) : today.slice(0, 7));
@@ -264,7 +285,7 @@ export const generatePreview = async (actor, { branchId: requested, month: reqMo
 
     const commissions = await payrollCommission(tx, actor, branchId, month, results.filter((r) => combinedContract(r.payslip.compensationType)).map((r) => r.staff.id), false, { startDate: effStartDate, endDate: effEndDate });
     // Replace only an equivalent draft; preserve drafts for other employees, types and periods.
-    await tx.payrollRun.deleteMany({ where: { branchId, month, status: 'DRAFT', AND: [
+    await tx.payrollRun.deleteMany({ where: { tenantId: actor.tenantId, branchId, month, status: 'DRAFT', AND: [
       { policySnapshot: { path: ['startDate'], equals: effStartDate } },
       { policySnapshot: { path: ['endDate'], equals: effEndDate } },
       { policySnapshot: { path: ['runType'], equals: effRunType } },
@@ -274,6 +295,7 @@ export const generatePreview = async (actor, { branchId: requested, month: reqMo
     ] } });
     const run = await tx.payrollRun.create({
       data: {
+        tenantId: actor.tenantId,
         branchId, month, status: 'DRAFT',
         policySnapshot: {
           ...policy,
@@ -289,13 +311,14 @@ export const generatePreview = async (actor, { branchId: requested, month: reqMo
         generatedByName: actor.name,
         payslips: {
           create: results.map((r) => ({
+            tenantId: actor.tenantId,
             staffId: r.staff.id, snapshot: { ...r.payslip, commissionPayable: commissions.get(r.staff.id)?.amount ?? 0, canFinalize: r.canFinalize, blockReason: r.blockReason },
             netPayable: round2(r.payslip.netPayable), grossPayable: round2(r.payslip.grossPayable),
           })),
         },
       },
     });
-    return runDTO(tx, run.id);
+    return runDTO(tx, run.id, actor);
   });
 };
 
@@ -304,10 +327,13 @@ export const finalizeRun = async (actor, runId) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.payrollRun.findUnique({ where: { id: runId } });
     if (!header) throw notFound('PAYROLL_NOT_FOUND', 'Payroll run not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot finalize payroll for another branch.');
     await lockCommissionBranch(tx, header.branchId);
     await tx.$executeRaw`SELECT 1 FROM "PayrollRun" WHERE id = ${runId} FOR UPDATE`;
     const draft = await tx.payrollRun.findUnique({ where: { id: runId } });
     if (!draft) throw notFound('PAYROLL_NOT_FOUND', `Payroll run '${runId}' not found. Please generate a preview first.`);
+    assertTenantAccess(actor, draft);
     assertBranchAccess(actor, draft.branchId, 'Access Denied: Cannot finalize payroll for another branch.');
     if (draft.status !== 'DRAFT') throw conflict('NOT_DRAFT', `Payroll run is already in status '${draft.status}' and cannot be finalized.`);
 
@@ -348,26 +374,33 @@ export const finalizeRun = async (actor, runId) => {
     const commissions = await payrollCommission(tx, actor, draft.branchId, draft.month, results.filter((r) => combinedContract(r.payslip.compensationType)).map((r) => r.staff.id), true, { ...draft.policySnapshot, startDate: actualStart, endDate: actualEnd });
 
     const branch = await tx.branch.findUnique({ where: { id: draft.branchId } });
-    await tx.payslip.deleteMany({ where: { runId } });
+    await tx.payslip.deleteMany({ where: { tenantId: actor.tenantId, runId } });
     for (const r of results) {
       const commission = commissions.get(r.staff.id) ?? { amount: 0, statements: [] };
       const payslip = await tx.payslip.create({
         data: {
+          tenantId: actor.tenantId,
           runId, staffId: r.staff.id, payslipNumber: await nextPeriodSequence(tx, branch.code, 'PS', draft.month),
           snapshot: { ...r.payslip, commissionPayable: commission.amount, commissionLinks: commission.statements, canFinalize: true, blockReason: undefined }, netPayable: round2(r.payslip.netPayable), grossPayable: round2(r.payslip.grossPayable),
         },
       });
       if (commission.statements.length) {
-        const linked = await tx.commissionStatement.updateMany({ where: { id: { in: commission.statements.map((s) => s.id) }, payrollPayslipId: null }, data: { payrollPayslipId: payslip.id } });
+        const linked = await tx.commissionStatement.updateMany({
+          where: { tenantId: actor.tenantId, id: { in: commission.statements.map((s) => s.id) }, payrollPayslipId: null },
+          data: { payrollPayslipId: payslip.id },
+        });
         if (linked.count !== commission.statements.length) throw conflict('COMMISSION_ALREADY_LINKED', 'Commission is already linked to another payroll.');
       }
       // Lock the overtime consumed by this payslip so it can never be paid twice.
       if (r.payslip.consumedOvertimeIds?.length) {
-        const claimed = await tx.overtimeRecord.updateMany({ where: { id: { in: r.payslip.consumedOvertimeIds }, status: 'APPROVED', payrollRunId: null }, data: { payrollRunId: runId } });
+        const claimed = await tx.overtimeRecord.updateMany({
+          where: { tenantId: actor.tenantId, id: { in: r.payslip.consumedOvertimeIds }, status: 'APPROVED', payrollRunId: null },
+          data: { payrollRunId: runId },
+        });
         if (claimed.count !== r.payslip.consumedOvertimeIds.length) throw conflict('OVERTIME_ALREADY_CONSUMED', 'Approved overtime changed or was reserved by another payroll. Regenerate payroll.');
       }
       // Freeze one-off adjustments and book advance recoveries against this run.
-      await lockPayrollExtras(tx, runId, draft.month, r.payslip);
+      await lockPayrollExtras(tx, runId, draft.month, r.payslip, actor.tenantId);
     }
     await tx.payrollRun.update({
       where: { id: runId },
@@ -390,7 +423,7 @@ export const finalizeRun = async (actor, runId) => {
       },
     });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'PAYROLL_FINALIZED', entity: 'PayrollRun', entityId: runId, branchId: draft.branchId, after: { month: draft.month } });
-    return runDTO(tx, runId);
+    return runDTO(tx, runId, actor);
   });
 };
 
@@ -399,28 +432,43 @@ export const cancelRun = async (actor, runId, reason) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.payrollRun.findUnique({ where: { id: runId } });
     if (!header) throw notFound('PAYROLL_NOT_FOUND', 'Payroll run not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot cancel payroll run for another branch.');
     await lockCommissionBranch(tx, header.branchId);
     const run = await tx.payrollRun.findUnique({ where: { id: runId }, include: { payments: true, payslips: true } });
     if (!run) throw notFound('PAYROLL_NOT_FOUND', `Payroll run '${runId}' not found.`);
+    assertTenantAccess(actor, run);
     assertBranchAccess(actor, run.branchId, 'Access Denied: Cannot cancel payroll run for another branch.');
     if (run.status === 'CANCELLED') throw conflict('ALREADY_CANCELLED', 'This payroll run is already cancelled.');
     if (run.payments.some((p) => p.status === 'COMPLETED')) {
       throw conflict('HAS_PAYMENTS', 'Runs with payments cannot be cancelled until all payments are properly reversed.');
     }
-    await tx.overtimeRecord.updateMany({ where: { payrollRunId: runId }, data: { payrollRunId: null } });
-    await releasePayrollExtras(tx, runId);
+    await tx.overtimeRecord.updateMany({ where: { tenantId: actor.tenantId, payrollRunId: runId }, data: { payrollRunId: null } });
+    await releasePayrollExtras(tx, runId, actor.tenantId);
     const createdIds = run.payslips.flatMap((ps) => ps.snapshot.commissionLinks ?? []).filter((s) => s.createdByPayroll).map((s) => s.id);
-    const created = await tx.commissionStatement.findMany({ where: { id: { in: createdIds } }, select: { runId: true } });
+    const created = await tx.commissionStatement.findMany({
+      where: { tenantId: actor.tenantId, id: { in: createdIds } },
+      select: { runId: true },
+    });
     const commissionRunIds = [...new Set(created.map((s) => s.runId))];
-    await tx.commissionStatement.updateMany({ where: { payrollPayslipId: { in: run.payslips.map((ps) => ps.id) } }, data: { payrollPayslipId: null } });
-    await tx.commissionEvent.updateMany({ where: { consumedByRunId: { in: commissionRunIds } }, data: { consumedByRunId: null } });
-    await tx.commissionRun.updateMany({ where: { id: { in: commissionRunIds } }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledByUserId: actor.id, cancelledByName: actor.name, cancellationReason: reason } });
+    await tx.commissionStatement.updateMany({
+      where: { tenantId: actor.tenantId, payrollPayslipId: { in: run.payslips.map((ps) => ps.id) } },
+      data: { payrollPayslipId: null },
+    });
+    await tx.commissionEvent.updateMany({
+      where: { tenantId: actor.tenantId, consumedByRunId: { in: commissionRunIds } },
+      data: { consumedByRunId: null },
+    });
+    await tx.commissionRun.updateMany({
+      where: { tenantId: actor.tenantId, id: { in: commissionRunIds } },
+      data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledByUserId: actor.id, cancelledByName: actor.name, cancellationReason: reason },
+    });
     await tx.payrollRun.update({
       where: { id: runId },
       data: { status: 'CANCELLED', cancellationReason: reason, cancelledAt: new Date(), cancelledByUserId: actor.id, cancelledByName: actor.name },
     });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'PAYROLL_CANCELLED', entity: 'PayrollRun', entityId: runId, branchId: run.branchId, after: { reason } });
-    return runDTO(tx, runId);
+    return runDTO(tx, runId, actor);
   });
 };
 
@@ -431,19 +479,23 @@ export const recordPayment = async (actor, input) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.payrollRun.findUnique({ where: { id: input.payrollRunId } });
     if (!header) throw notFound('PAYROLL_NOT_FOUND', 'Payroll run not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot record payment for another branch.');
     await lockCommissionBranch(tx, header.branchId);
     const requestKey = input.idempotencyKey ? `${actor.id}:payroll:${input.idempotencyKey}` : null;
     if (requestKey) {
       const replay = await tx.payrollPayment.findUnique({ where: { requestKey } });
-      if (replay) return { payrollRun: await runDTO(tx, replay.runId), payment: toPaymentDTO(replay) };
+      if (replay) return { payrollRun: await runDTO(tx, replay.runId, actor), payment: toPaymentDTO(replay) };
     }
     await tx.$executeRaw`SELECT 1 FROM "Payslip" WHERE id = ${input.payslipId} FOR UPDATE`;
     const run = await tx.payrollRun.findUnique({ where: { id: input.payrollRunId }, include: runInclude });
     if (!run) throw notFound('PAYROLL_NOT_FOUND', `Payroll run '${input.payrollRunId}' not found.`);
+    assertTenantAccess(actor, run);
     assertBranchAccess(actor, run.branchId, 'Access Denied: Cannot record payment for another branch.');
     if (['DRAFT', 'CANCELLED'].includes(run.status)) throw conflict('RUN_NOT_PAYABLE', `Cannot record payment on a payroll run in '${run.status}' status.`);
     const ps = run.payslips.find((p) => p.id === input.payslipId);
     if (!ps) throw notFound('PAYSLIP_NOT_FOUND', `Payslip '${input.payslipId}' not found in this payroll run.`);
+    assertTenantAccess(actor, ps);
     const slip = toPayslipDTO(ps, run);
     const amount = round2(input.amount);
     if (amount.lessThanOrEqualTo(0)) throw badRequest('INVALID_AMOUNT', 'Payment must be greater than zero.');
@@ -456,19 +508,24 @@ export const recordPayment = async (actor, input) => {
     const salaryOutstanding = toDec(ps.netPayable).minus(completedAmount(ps.payments));
     const salaryAmount = amount.lessThan(salaryOutstanding) ? amount : salaryOutstanding;
     const commissionAmount = round2(amount.minus(salaryAmount));
-    if (commissionAmount.greaterThan(0)) await assertCommissionAvailable(tx, run.branchId, ps.staffId, commissionAmount);
+    if (commissionAmount.greaterThan(0)) await assertCommissionAvailable(tx, actor, run.branchId, ps.staffId, commissionAmount);
     const source = salaryAmount.greaterThan(0) ? await payoutMoney(tx, actor, {
       branchId: run.branchId, method: input.method, onlineAccountId: input.onlineAccountId, amount: salaryAmount, type: 'PAYROLL_PAYOUT',
       sourceModule: 'PAYROLL', sourceId: ps.id, reference: paymentNumber, description: `Salary ${run.month} — ${slip.staffName}`,
     }) : {};
     const payment = await tx.payrollPayment.create({
       data: {
+        tenantId: actor.tenantId,
         paymentNumber, runId: run.id, payslipId: ps.id, staffId: ps.staffId, staffName: slip.staffName, branchId: run.branchId, amount: salaryAmount, commissionAmount, requestKey,
         method: input.method, ...source, reference: input.reference || '', notes: input.notes || null, paidByUserId: actor.id, paidByName: actor.name,
       },
     });
     let remainder = commissionAmount;
-    const linked = await tx.commissionStatement.findMany({ where: { payrollPayslipId: ps.id }, include: { payments: true, run: true }, orderBy: { id: 'asc' } });
+    const linked = await tx.commissionStatement.findMany({
+      where: { tenantId: actor.tenantId, payrollPayslipId: ps.id },
+      include: { payments: true, run: true },
+      orderBy: { id: 'asc' },
+    });
     for (const st of linked) {
       if (remainder.lessThanOrEqualTo(0)) break;
       if (st.run.status !== 'FINALIZED') throw conflict('COMMISSION_NOT_PAYABLE', 'Linked commission is not finalized.');
@@ -478,15 +535,20 @@ export const recordPayment = async (actor, input) => {
       const commissionNumber = await nextSequence(tx, branch.code, 'COMPAY', Number((await getBusinessDate(tx)).slice(0, 4)));
       const commissionSource = await payoutMoney(tx, actor, { branchId: run.branchId, method: input.method, onlineAccountId: input.onlineAccountId, amount: part,
         type: 'COMMISSION_PAYOUT', sourceModule: 'COMMISSION', sourceId: st.id, reference: commissionNumber, description: `Commission with payroll ${paymentNumber} — ${slip.staffName}` });
-      await tx.commissionPayment.create({ data: { paymentNumber: commissionNumber, runId: st.runId, statementId: st.id, staffId: ps.staffId, staffName: slip.staffName,
-        branchId: run.branchId, amount: part, payrollPaymentId: payment.id, method: input.method, ...commissionSource,
-        reference: input.reference || '', notes: input.notes || null, paidByUserId: actor.id, paidByName: actor.name } });
+      await tx.commissionPayment.create({
+        data: {
+          tenantId: actor.tenantId,
+          paymentNumber: commissionNumber, runId: st.runId, statementId: st.id, staffId: ps.staffId, staffName: slip.staffName,
+          branchId: run.branchId, amount: part, payrollPaymentId: payment.id, method: input.method, ...commissionSource,
+          reference: input.reference || '', notes: input.notes || null, paidByUserId: actor.id, paidByName: actor.name,
+        },
+      });
       if (!salaryAmount.greaterThan(0)) await tx.payrollPayment.update({ where: { id: payment.id }, data: commissionSource });
       remainder = round2(remainder.minus(part));
     }
     if (remainder.greaterThan(0)) throw conflict('COMMISSION_BALANCE_CHANGED', 'Linked commission balance changed. Regenerate payroll.');
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'PAYROLL_PAID', entity: 'PayrollPayment', entityId: payment.id, branchId: run.branchId, after: { amount: amount.toNumber(), method: input.method } });
-    return { payrollRun: await runDTO(tx, run.id), payment: toPaymentDTO(await tx.payrollPayment.findUnique({ where: { id: payment.id } })) };
+    return { payrollRun: await runDTO(tx, run.id, actor), payment: toPaymentDTO(await tx.payrollPayment.findUnique({ where: { id: payment.id } })) };
   });
 };
 
@@ -495,17 +557,22 @@ export const reversePayment = async (actor, paymentId, reason) => {
   return prisma.$transaction(async (tx) => {
     const header = await tx.payrollPayment.findUnique({ where: { id: paymentId } });
     if (!header) throw notFound('PAYMENT_NOT_FOUND', 'Payroll payment not found.');
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot reverse payments of another branch.');
     await lockCommissionBranch(tx, header.branchId);
     await tx.$executeRaw`SELECT 1 FROM "PayrollPayment" WHERE id = ${paymentId} FOR UPDATE`;
     const p = await tx.payrollPayment.findUnique({ where: { id: paymentId } });
     if (!p) throw notFound('PAYMENT_NOT_FOUND', `Payroll payment '${paymentId}' not found.`);
+    assertTenantAccess(actor, p);
     assertBranchAccess(actor, p.branchId, 'Access Denied: Cannot reverse payments of another branch.');
     if (p.status === 'REVERSED') throw conflict('ALREADY_REVERSED', 'This payroll payment is already reversed.');
     if (toDec(p.amount).greaterThan(0)) await reverseMoney(tx, actor, {
       branchId: p.branchId, method: p.method, onlineAccountId: p.onlineAccountId, amount: p.amount, sourceModule: 'PAYROLL',
       sourceId: p.id, reference: p.paymentNumber, description: `Reversal of salary payment ${p.paymentNumber}: ${reason}`,
     });
-    const commissionPayments = await tx.commissionPayment.findMany({ where: { payrollPaymentId: p.id, status: 'COMPLETED' } });
+    const commissionPayments = await tx.commissionPayment.findMany({
+      where: { tenantId: actor.tenantId, payrollPaymentId: p.id, status: 'COMPLETED' },
+    });
     for (const cp of commissionPayments) {
       await reverseMoney(tx, actor, { branchId: cp.branchId, method: cp.method, onlineAccountId: cp.onlineAccountId, amount: cp.amount, sourceModule: 'COMMISSION',
         sourceId: cp.id, reference: cp.paymentNumber, description: `Reversal with payroll ${p.paymentNumber}: ${reason}` });
@@ -527,6 +594,9 @@ export const applyManualDeduction = async (actor, payslipId, { amount: rawAmount
   return prisma.$transaction(async (tx) => {
     const header = await tx.payslip.findUnique({ where: { id: payslipId }, include: { run: true } });
     if (!header) throw notFound('PAYSLIP_NOT_FOUND', `Payslip '${payslipId}' not found.`);
+    assertTenantAccess(actor, header);
+    assertTenantAccess(actor, header.run);
+    assertBranchAccess(actor, header.run.branchId, 'Access Denied: Cannot deduct from payslip of another branch.');
     await lockCommissionBranch(tx, header.run.branchId);
     await tx.$executeRaw`SELECT 1 FROM "Payslip" WHERE id = ${payslipId} FOR UPDATE`;
     const ps = await tx.payslip.findUnique({
@@ -534,6 +604,8 @@ export const applyManualDeduction = async (actor, payslipId, { amount: rawAmount
       include: { run: true, payments: true },
     });
     if (!ps) throw notFound('PAYSLIP_NOT_FOUND', `Payslip '${payslipId}' not found.`);
+    assertTenantAccess(actor, ps);
+    assertTenantAccess(actor, ps.run);
     assertBranchAccess(actor, ps.run.branchId, 'Access Denied: Cannot deduct from payslip of another branch.');
     if (ps.run.status !== 'DRAFT') {
       throw conflict('PAYROLL_IMMUTABLE', 'Finalized payroll history is immutable. Add deductions before finalization.');
@@ -552,6 +624,7 @@ export const applyManualDeduction = async (actor, payslipId, { amount: rawAmount
     // 1. Create a PayrollAdjustment record for tracking
     const adjustment = await tx.payrollAdjustment.create({
       data: {
+        tenantId: actor.tenantId,
         branchId: ps.run.branchId,
         staffId: ps.staffId,
         month: ps.run.month,
@@ -619,20 +692,23 @@ export const applyManualDeduction = async (actor, payslipId, { amount: rawAmount
 
     return {
       payslip: toPayslipDTO(updatedPayslip, updatedPayslip.run),
-      payrollRun: await runDTO(tx, ps.runId),
+      payrollRun: await runDTO(tx, ps.runId, actor),
       adjustment,
     };
   });
 };
 
-
 // ── Staff portal ─────────────────────────────────────────────────────────────
 
 export const personalPayslips = async (actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (!actor.staffId) throw forbidden('FORBIDDEN', 'Staff record associated with the authenticated user could not be found.');
+  const staff = await prisma.staff.findUnique({ where: { id: actor.staffId } });
+  if (!staff || staff.tenantId !== actor.tenantId) throw forbidden('FORBIDDEN', 'Access Denied: Staff record not found.');
+
   // Draft and cancelled runs are never visible to staff.
   const slips = await prisma.payslip.findMany({
-    where: { staffId: actor.staffId, run: { status: { notIn: ['DRAFT', 'CANCELLED'] } } },
+    where: { tenantId: actor.tenantId, staffId: actor.staffId, run: { status: { notIn: ['DRAFT', 'CANCELLED'] } } },
     include: { payments: true, run: true },
   });
   return slips.map((ps) => toPayslipDTO(ps, ps.run)).sort((a, b) => b.month.localeCompare(a.month));
@@ -648,21 +724,33 @@ export const personalPayslips = async (actor) => {
 export const monthlySummary = async (actor, { branchId: requested, month }) => {
   noAccountant(actor);
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot view payroll for another branch.');
+  await assertTenantBranch(prisma, actor, branchId);
   const from = dateOnly(`${month}-01`);
   const to = dateOnly(`${month}-${String(getCalendarDaysInMonth(month)).padStart(2, '0')}`);
-  const runs = await prisma.payrollRun.findMany({ where: { branchId, month, status: { not: 'CANCELLED' } }, include: runInclude });
+  const runs = await prisma.payrollRun.findMany({
+    where: { tenantId: actor.tenantId, branchId, month, status: { not: 'CANCELLED' } },
+    include: runInclude,
+  });
   const run = runs.find((r) => r.status !== 'DRAFT') ?? runs.find((r) => r.status === 'DRAFT');
   const slips = runs.flatMap((r) => toRunDTO(r).payslips);
   const comRuns = await prisma.commissionRun.findMany({
-    where: { branchId, status: { notIn: ['DRAFT', 'CANCELLED'] }, startDate: { gte: from }, endDate: { lte: to } },
+    where: { tenantId: actor.tenantId, branchId, status: { notIn: ['DRAFT', 'CANCELLED'] }, startDate: { gte: from }, endDate: { lte: to } },
     include: { statements: { include: { payments: true } } },
   });
   const pending = await prisma.commissionEvent.groupBy({
-    by: ['staffId', 'type'], where: { branchId, consumedByRunId: null, eventDate: { gte: from, lte: to } }, _sum: { amount: true },
+    by: ['staffId', 'type'],
+    where: { tenantId: actor.tenantId, branchId, consumedByRunId: null, eventDate: { gte: from, lte: to } },
+    _sum: { amount: true },
   });
-  const advances = await prisma.salaryAdvance.findMany({ where: { branchId, status: 'ACTIVE' }, include: { recoveries: true } });
+  const advances = await prisma.salaryAdvance.findMany({
+    where: { tenantId: actor.tenantId, branchId, status: 'ACTIVE' },
+    include: { recoveries: true },
+  });
   // Everyone employed during the month (joined by month end; active, or left on/after the 1st).
-  const staff = await prisma.staff.findMany({ where: { branchId, joiningDate: { lte: to }, OR: [{ isActive: true }, { exitDate: { gte: from } }] }, orderBy: { employeeCode: 'asc' } });
+  const staff = await prisma.staff.findMany({
+    where: { tenantId: actor.tenantId, branchId, joiningDate: { lte: to }, OR: [{ isActive: true }, { exitDate: { gte: from } }] },
+    orderBy: { employeeCode: 'asc' },
+  });
 
   const rows = staff.map((s) => {
     const mine = slips.filter((p) => p.staffId === s.id);

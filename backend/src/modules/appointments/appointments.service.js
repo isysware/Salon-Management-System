@@ -7,7 +7,7 @@ import { assertBookingConflicts } from '../bookings/bookings.scheduling.js';
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { dateOnly } from '../../lib/dates.js';
 import { add, round2, toDec } from '../../lib/money.js';
 import { nextSequence } from '../../lib/sequence.js';
@@ -68,7 +68,7 @@ const lockBranchDay = (tx, branchId, date) =>
  * Every item/component runs back-to-back from `startTime`. Package price is the package's
  * own selling price — assigning more staff never multiplies it.
  */
-const scheduleItems = async (tx, { branchId, date, startTime, rawItems, excludeAppointmentId }) => {
+const scheduleItems = async (tx, { branchId, date, startTime, rawItems, excludeAppointmentId, actor }) => {
   if (!rawItems?.length) throw badRequest('NO_ITEMS', 'At least one service or package must be selected.');
 
   const serviceIds = rawItems.filter((i) => i.type === 'SERVICE').map((i) => i.itemId);
@@ -210,10 +210,11 @@ const scheduleItems = async (tx, { branchId, date, startTime, rawItems, excludeA
   };
 };
 
-const itemCreateData = (items) =>
+const itemCreateData = (items, tenantId) =>
   items.map(({ components, ...it }) => ({
     ...it,
-    ...(components.length ? { components: { create: components } } : {}),
+    ...(tenantId ? { tenantId } : {}),
+    ...(components?.length ? { components: { create: components } } : {}),
   }));
 
 const toRawItems = (apt) =>
@@ -291,6 +292,7 @@ export const getQueue = async (actor, { branchId, date }) => {
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 export const createAppointment = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   assertBookingRole(actor);
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot book appointments for another branch.');
   const norm = normalizePhoneDigits(input.clientPhone);
@@ -301,9 +303,17 @@ export const createAppointment = async (input, actor) => {
   return prisma.$transaction(async (tx) => {
     const branch = await tx.branch.findUnique({ where: { id: branchId } });
     if (!branch || !branch.isActive) throw badRequest('BRANCH_INACTIVE', `Branch '${branchId}' is invalid or deactivated.`);
+    assertTenantAccess(actor, branch, 'Access Denied: Branch belongs to another salon company.');
+
+    if (input.clientId) {
+      const clientCheck = await tx.client.findUnique({ where: { id: input.clientId } });
+      if (!clientCheck || clientCheck.branchId !== branchId || (clientCheck.tenantId && clientCheck.tenantId !== actor.tenantId)) {
+        throw badRequest('CLIENT_NOT_FOUND', `Client '${input.clientId}' is invalid for this salon branch.`);
+      }
+    }
 
     await lockBranchDay(tx, branchId, input.date);
-    const plan = await scheduleItems(tx, { branchId, date: input.date, startTime: input.startTime, rawItems: input.items });
+    const plan = await scheduleItems(tx, { branchId, date: input.date, startTime: input.startTime, rawItems: input.items, actor });
 
     const client = await findOrCreateClient(tx, {
       branchId, clientId: input.clientId, name: input.clientName, phone: input.clientPhone,
@@ -314,6 +324,7 @@ export const createAppointment = async (input, actor) => {
     const now = new Date();
     const apt = await tx.appointment.create({
       data: {
+        tenantId:              actor.tenantId,
         appointmentNumber:     await nextSequence(tx, branch.code, 'APT', Number(input.date.slice(0, 4))),
         branchId,
         clientId:              client.id,
@@ -332,7 +343,7 @@ export const createAppointment = async (input, actor) => {
         createdById:           actor.id,
         createdByName:         actor.name,
         ...(status === 'CONFIRMED' ? { confirmedById: actor.id, confirmedByName: actor.name, confirmedAt: now } : {}),
-        items:                 { create: itemCreateData(plan.items) },
+        items:                 { create: itemCreateData(plan.items, actor.tenantId) },
       },
       include,
     });
@@ -348,7 +359,7 @@ export const createAppointment = async (input, actor) => {
 export const updateAppointment = async (id, input, actor) => {
   assertBookingRole(actor);
   return prisma.$transaction(async (tx) => {
-    const before = await loadOrThrow(tx, id);
+    const before = await loadOrThrow(tx, id, actor);
     assertBranchAccess(actor, before.branchId, 'Access Denied: Cannot modify appointments from another branch.');
     assertNotBilled(before, 'modify');
     if (INACTIVE_STATUSES.includes(before.status)) {
@@ -382,7 +393,7 @@ export const updateAppointment = async (id, input, actor) => {
 
     await tx.appointmentItem.deleteMany({ where: { appointmentId: id } });
     const apt = await tx.appointment.update({
-      where: { id }, data: { ...data, items: { create: itemCreateData(plan.items) } }, include,
+      where: { id }, data: { ...data, items: { create: itemCreateData(plan.items, actor.tenantId) } }, include,
     });
 
     await auditLog(tx, {
@@ -456,7 +467,7 @@ export const reschedule = async (id, { date, startTime, reason }, actor) => {
       where: { id },
       data: {
         date: dateOnly(date), startTime: newStart, endTime: plan.endTime, durationMinutes: plan.durationMinutes,
-        updatedById: actor.id, updatedByName: actor.name, items: { create: itemCreateData(plan.items) },
+        updatedById: actor.id, updatedByName: actor.name, items: { create: itemCreateData(plan.items, actor.tenantId) },
       },
       include,
     });

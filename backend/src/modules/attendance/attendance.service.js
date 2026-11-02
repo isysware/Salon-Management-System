@@ -6,7 +6,7 @@
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { dateOnly, getBusinessDate, ymd } from '../../lib/dates.js';
 import { nextSequence } from '../../lib/sequence.js';
 import { num, opt, iso } from '../../lib/dto.js';
@@ -50,18 +50,39 @@ export const toLeaveDTO = (l, staff) => ({
 
 const toHolidayDTO = (h) => ({ id: h.id, branchId: h.branchId, date: ymd(h.date), title: h.title });
 
-const staffMap = async (tx, ids) => {
-  const rows = await tx.staff.findMany({ where: { id: { in: [...new Set(ids)] } } });
+const staffMap = async (tx, ids, tenantId) => {
+  const rows = await tx.staff.findMany({
+    where: {
+      id: { in: [...new Set(ids)] },
+      ...(tenantId ? { tenantId } : {}),
+    },
+  });
   return new Map(rows.map((s) => [s.id, s]));
 };
 
-const holidaysFor = async (tx, branchId) =>
-  (await tx.branchHoliday.findMany({ where: { branchId: { in: ['ALL', branchId] } } })).map(toHolidayDTO);
+const holidaysFor = async (tx, branchId, tenantId) =>
+  (await tx.branchHoliday.findMany({
+    where: {
+      branchId: { in: ['ALL', branchId] },
+      ...(tenantId ? { tenantId } : {}),
+    },
+  })).map(toHolidayDTO);
 
 /** Leaves in the shape the shared allowance engine expects. */
-const leavesForEngine = async (tx, staffId) => {
-  const rows = await tx.leaveRecord.findMany({ where: { staffId } });
-  const days = await tx.attendanceRecord.findMany({ where: { leaveId: { in: rows.map((l) => l.id) } }, select: { leaveId: true, workDate: true } });
+const leavesForEngine = async (tx, staffId, tenantId) => {
+  const rows = await tx.leaveRecord.findMany({
+    where: {
+      staffId,
+      ...(tenantId ? { tenantId } : {}),
+    },
+  });
+  const days = await tx.attendanceRecord.findMany({
+    where: {
+      leaveId: { in: rows.map((l) => l.id) },
+      ...(tenantId ? { tenantId } : {}),
+    },
+    select: { leaveId: true, workDate: true },
+  });
   return rows.map((l) => {
     const workingDates = days.filter((d) => d.leaveId === l.id).map((d) => ymd(d.workDate));
     return { staffId: l.staffId, status: l.status, type: l.type, startDate: ymd(l.startDate), endDate: ymd(l.endDate), totalDays: l.totalDays, ...(workingDates.length ? { workingDates } : {}) };
@@ -103,33 +124,75 @@ const evaluateDay = (staffDTO, checkIn, checkOut, isOvernight, status) => {
 // ═══ ATTENDANCE ═══════════════════════════════════════════════════════════════
 
 export const listAttendance = async (actor, { branchId, date, startDate, endDate, staffId } = {}) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId, 'Access Denied: Cannot view attendance of another branch.');
+  }
+
   const sid = resolveStaffFilter(actor, staffId);
+  if (sid) {
+    const s = await prisma.staff.findUnique({ where: { id: sid } });
+    if (!s || s.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff record belongs to another salon company.');
+    }
+    if (actor.role === 'ADMIN' && s.branchId !== actor.branchId) {
+      throw forbidden('BRANCH_FORBIDDEN', 'Access Denied: Cannot view attendance of staff in another branch.');
+    }
+  }
+
   const b = actor.role === 'STAFF' ? null : resolveReadBranch(actor, branchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view attendance of another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+
   const range = {};
   if (date) range.equals = dateOnly(date);
   if (startDate) range.gte = dateOnly(startDate);
   if (endDate) range.lte = dateOnly(endDate);
+
   const rows = await prisma.attendanceRecord.findMany({
-    where: { ...(b ? { branchId: b } : {}), ...(sid ? { staffId: sid } : {}), ...(Object.keys(range).length ? { workDate: range } : {}) },
-    include: recordInclude, orderBy: [{ workDate: 'desc' }],
+    where: {
+      tenantId: actor.tenantId,
+      ...(b ? { branchId: b } : {}),
+      ...(sid ? { staffId: sid } : {}),
+      ...(Object.keys(range).length ? { workDate: range } : {}),
+    },
+    include: recordInclude,
+    orderBy: [{ workDate: 'desc' }],
   });
-  const staff = await staffMap(prisma, rows.map((r) => r.staffId));
+  const staff = await staffMap(prisma, rows.map((r) => r.staffId), actor.tenantId);
   return rows.map((r) => toAttendanceDTO(r, staff.get(r.staffId)));
 };
 
 export const createAttendance = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot record attendance for another branch.');
+
   return prisma.$transaction(async (tx) => {
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+
     await lockStaffPayBranch(tx, branchId);
     const staff = await tx.staff.findUnique({ where: { id: input.staffId } });
     if (!staff || !staff.isActive) throw badRequest('STAFF_INVALID', `Staff member '${input.staffId}' is inactive or not found.`);
+    if (staff.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff member belongs to another salon company.');
+    }
     if (staff.branchId !== branchId) throw badRequest('STAFF_BRANCH', `Staff member '${staff.name}' does not belong to this branch.`);
     await assertPayrollPeriodOpen(tx, staff.id, input.date);
+
     if (await tx.attendanceRecord.findUnique({ where: { staffId_workDate: { staffId: staff.id, workDate: dateOnly(input.date) } } })) {
       throw conflict('ATTENDANCE_EXISTS', `An attendance record for ${staff.name} on ${input.date} already exists. Use edit/correction to update existing punches.`);
     }
     const leave = await tx.leaveRecord.findFirst({
-      where: { staffId: staff.id, status: 'APPROVED', startDate: { lte: dateOnly(input.date) }, endDate: { gte: dateOnly(input.date) } },
+      where: { tenantId: actor.tenantId, staffId: staff.id, status: 'APPROVED', startDate: { lte: dateOnly(input.date) }, endDate: { gte: dateOnly(input.date) } },
     });
     if (leave) throw conflict('ON_LEAVE', `Cannot record attendance: ${staff.name} is on approved leave (${leave.leaveNumber}) on ${input.date}.`);
 
@@ -139,12 +202,21 @@ export const createAttendance = async (input, actor) => {
     const source = input.source || 'MANUAL';
     const record = await tx.attendanceRecord.create({
       data: {
-        branchId, staffId: staff.id, workDate: dateOnly(input.date), checkIn: input.checkIn, checkOut: input.checkOut || null,
-        ...day, status: input.status || (input.checkIn && !input.checkOut ? 'MISSING_PUNCH' : 'PRESENT'), source, isOvernightShift: isOvernight, notes: input.notes || null,
+        tenantId: actor.tenantId,
+        branchId,
+        staffId: staff.id,
+        workDate: dateOnly(input.date),
+        checkIn: input.checkIn,
+        checkOut: input.checkOut || null,
+        ...day,
+        status: input.status || (input.checkIn && !input.checkOut ? 'MISSING_PUNCH' : 'PRESENT'),
+        source,
+        isOvernightShift: isOvernight,
+        notes: input.notes || null,
         punches: {
           create: [
-            { type: 'CHECK_IN', timestamp: input.checkIn, source },
-            ...(input.checkOut ? [{ type: 'CHECK_OUT', timestamp: input.checkOut, source }] : []),
+            { tenantId: actor.tenantId, type: 'CHECK_IN', timestamp: input.checkIn, source },
+            ...(input.checkOut ? [{ tenantId: actor.tenantId, type: 'CHECK_OUT', timestamp: input.checkOut, source }] : []),
           ],
         },
       },
@@ -155,17 +227,26 @@ export const createAttendance = async (input, actor) => {
   });
 };
 
-export const correctAttendance = async (id, input, actor) =>
-  prisma.$transaction(async (tx) => {
+export const correctAttendance = async (id, input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  return prisma.$transaction(async (tx) => {
     const header = await tx.attendanceRecord.findUnique({ where: { id } });
     if (!header) throw notFound('ATTENDANCE_NOT_FOUND', `Attendance record '${id}' not found.`);
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot correct attendance for another branch.');
+
     await lockStaffPayBranch(tx, header.branchId);
     const record = await tx.attendanceRecord.findUnique({ where: { id }, include: recordInclude });
     if (!record) throw notFound('ATTENDANCE_NOT_FOUND', `Attendance record '${id}' not found.`);
+    assertTenantAccess(actor, record);
     assertBranchAccess(actor, record.branchId, 'Access Denied: Cannot correct attendance for another branch.');
+
     await assertPayrollPeriodOpen(tx, record.staffId, ymd(record.workDate));
     if (record.leaveId) throw conflict('ON_LEAVE', 'Cancel the approved leave before changing its attendance.');
     const staff = await tx.staff.findUnique({ where: { id: record.staffId } });
+    if (!staff || staff.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff member belongs to another salon company.');
+    }
 
     const snap = (r) => ({
       checkIn: r.checkIn, checkOut: r.checkOut ?? undefined, status: r.status, workedHours: num(r.workedHours),
@@ -183,19 +264,35 @@ export const correctAttendance = async (id, input, actor) =>
     });
     // Corrections are an audit trail (before/after), never a silent overwrite.
     await tx.attendanceCorrection.create({
-      data: { recordId: id, beforeSnapshot: snap(record), afterSnapshot: snap(updated), reason: input.reason, editedByUserId: actor.id, editedByName: actor.name },
+      data: {
+        tenantId: actor.tenantId,
+        recordId: id,
+        beforeSnapshot: snap(record),
+        afterSnapshot: snap(updated),
+        reason: input.reason,
+        editedByUserId: actor.id,
+        editedByName: actor.name,
+      },
     });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'ATTENDANCE_CORRECTED', entity: 'AttendanceRecord', entityId: id, branchId: record.branchId, before: snap(record), after: snap(updated) });
     return toAttendanceDTO(await tx.attendanceRecord.findUnique({ where: { id }, include: recordInclude }), staff);
   });
+};
 
 export const finalizeDay = async ({ branchId: requested, date }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot finalize attendance for another branch.');
+
   return prisma.$transaction(async (tx) => {
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+
     await lockStaffPayBranch(tx, branchId);
     if (date > (await getBusinessDate(tx))) throw badRequest('FUTURE_DATE', 'Cannot finalize attendance for a future date. Wait until the workday is completed.');
-    const holidays = await holidaysFor(tx, branchId);
-    const staffRows = await tx.staff.findMany({ where: { branchId, isActive: true } });
+    const holidays = await holidaysFor(tx, branchId, actor.tenantId);
+    const staffRows = await tx.staff.findMany({ where: { tenantId: actor.tenantId, branchId, isActive: true } });
     const absent = [];
     let finalizedCount = 0;
     for (const s of staffRows) {
@@ -206,8 +303,16 @@ export const finalizeDay = async ({ branchId: requested, date }, actor) => {
       if (!rec) {
         await tx.attendanceRecord.create({
           data: {
-            branchId, staffId: s.id, workDate: dateOnly(date), checkIn: 'ABSENT', checkOut: 'ABSENT', status: 'ABSENT',
-            scheduledHours: calculateScheduledHours(s.startTime, s.endTime), notes: 'Marked absent upon end-of-day finalization.', isFinalized: true,
+            tenantId: actor.tenantId,
+            branchId,
+            staffId: s.id,
+            workDate: dateOnly(date),
+            checkIn: 'ABSENT',
+            checkOut: 'ABSENT',
+            status: 'ABSENT',
+            scheduledHours: calculateScheduledHours(s.startTime, s.endTime),
+            notes: 'Marked absent upon end-of-day finalization.',
+            isFinalized: true,
           },
         });
         absent.push(s.name);
@@ -225,10 +330,17 @@ export const finalizeDay = async ({ branchId: requested, date }, actor) => {
 };
 
 export const markAllAttendance = async ({ branchId: requested, date, status = 'PRESENT', checkIn, checkOut, staffIds, notes }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot record attendance for another branch.');
+
   return prisma.$transaction(async (tx) => {
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+
     await lockStaffPayBranch(tx, branchId);
-    const where = { branchId, isActive: true };
+    const where = { tenantId: actor.tenantId, branchId, isActive: true };
     if (staffIds && staffIds.length > 0) {
       where.id = { in: staffIds };
     }
@@ -252,7 +364,7 @@ export const markAllAttendance = async ({ branchId: requested, date, status = 'P
 
       // Check if on approved leave
       const leave = await tx.leaveRecord.findFirst({
-        where: { staffId: s.id, status: 'APPROVED', startDate: { lte: dateOnly(date) }, endDate: { gte: dateOnly(date) } },
+        where: { tenantId: actor.tenantId, staffId: s.id, status: 'APPROVED', startDate: { lte: dateOnly(date) }, endDate: { gte: dateOnly(date) } },
       });
       if (leave) {
         skippedCount++;
@@ -269,6 +381,7 @@ export const markAllAttendance = async ({ branchId: requested, date, status = 'P
         const day = evaluateDay(toStaffDTO(s), cIn, cOut, isOvernight);
         await tx.attendanceRecord.create({
           data: {
+            tenantId: actor.tenantId,
             branchId,
             staffId: s.id,
             workDate: dateOnly(date),
@@ -281,8 +394,8 @@ export const markAllAttendance = async ({ branchId: requested, date, status = 'P
             notes: notes || 'Bulk marked present by manager.',
             punches: {
               create: [
-                ...(cIn ? [{ type: 'CHECK_IN', timestamp: cIn, source: 'MANUAL' }] : []),
-                ...(cOut ? [{ type: 'CHECK_OUT', timestamp: cOut, source: 'MANUAL' }] : []),
+                ...(cIn ? [{ tenantId: actor.tenantId, type: 'CHECK_IN', timestamp: cIn, source: 'MANUAL' }] : []),
+                ...(cOut ? [{ tenantId: actor.tenantId, type: 'CHECK_OUT', timestamp: cOut, source: 'MANUAL' }] : []),
               ],
             },
           },
@@ -290,6 +403,7 @@ export const markAllAttendance = async ({ branchId: requested, date, status = 'P
       } else {
         await tx.attendanceRecord.create({
           data: {
+            tenantId: actor.tenantId,
             branchId,
             staffId: s.id,
             workDate: dateOnly(date),
@@ -324,12 +438,19 @@ export const markAllAttendance = async ({ branchId: requested, date, status = 'P
 };
 
 export const bulkSaveAttendance = async ({ branchId: requested, date, records }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot record attendance for another branch.');
+
   return prisma.$transaction(async (tx) => {
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+
     await lockStaffPayBranch(tx, branchId);
     let savedCount = 0;
     const staffIds = records.map((r) => r.staffId);
-    const staffRows = await tx.staff.findMany({ where: { id: { in: staffIds }, branchId, isActive: true } });
+    const staffRows = await tx.staff.findMany({ where: { id: { in: staffIds }, tenantId: actor.tenantId, branchId, isActive: true } });
     const staffMap = new Map(staffRows.map((s) => [s.id, s]));
 
     for (const item of records) {
@@ -381,6 +502,9 @@ export const bulkSaveAttendance = async ({ branchId: requested, date, records },
       });
 
       if (existing) {
+        if (existing.tenantId !== actor.tenantId) {
+          throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Record belongs to another salon company.');
+        }
         await tx.attendanceRecord.update({
           where: { id: existing.id },
           data: {
@@ -401,6 +525,7 @@ export const bulkSaveAttendance = async ({ branchId: requested, date, records },
       } else {
         await tx.attendanceRecord.create({
           data: {
+            tenantId: actor.tenantId,
             branchId,
             staffId: staff.id,
             workDate: dateOnly(date),
@@ -421,10 +546,10 @@ export const bulkSaveAttendance = async ({ branchId: requested, date, records },
             punches: {
               create: [
                 ...(checkIn && !['ABSENT', 'HOLIDAY', 'WEEKLY_OFF', 'PAID_LEAVE', 'UNPAID_LEAVE'].includes(checkIn)
-                  ? [{ type: 'CHECK_IN', timestamp: checkIn, source: 'MANUAL' }]
+                  ? [{ tenantId: actor.tenantId, type: 'CHECK_IN', timestamp: checkIn, source: 'MANUAL' }]
                   : []),
                 ...(checkOut && !['ABSENT', 'HOLIDAY', 'WEEKLY_OFF', 'PAID_LEAVE', 'UNPAID_LEAVE'].includes(checkOut)
-                  ? [{ type: 'CHECK_OUT', timestamp: checkOut, source: 'MANUAL' }]
+                  ? [{ tenantId: actor.tenantId, type: 'CHECK_OUT', timestamp: checkOut, source: 'MANUAL' }]
                   : []),
               ],
             },
@@ -451,10 +576,17 @@ export const bulkSaveAttendance = async ({ branchId: requested, date, records },
 };
 
 export const importCSV = async ({ branchId: requested, rows }, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, requested, 'Access Denied: Cannot import attendance for another branch.');
+
   return prisma.$transaction(async (tx) => {
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+
     await lockStaffPayBranch(tx, branchId);
-    const staffRows = await tx.staff.findMany({ where: { branchId } });
+    const staffRows = await tx.staff.findMany({ where: { tenantId: actor.tenantId, branchId } });
     const byCode = new Map(staffRows.map((s) => [s.employeeCode.toUpperCase(), s]));
     let accepted = 0;
     let duplicates = 0;
@@ -476,7 +608,7 @@ export const importCSV = async ({ branchId: requested, rows }, actor) => {
       let day;
       try {
         await assertPayrollPeriodOpen(tx, staff.id, row.date);
-        const leave = await tx.leaveRecord.findFirst({ where: { staffId: staff.id, status: 'APPROVED', startDate: { lte: dateOnly(row.date) }, endDate: { gte: dateOnly(row.date) } } });
+        const leave = await tx.leaveRecord.findFirst({ where: { tenantId: actor.tenantId, staffId: staff.id, status: 'APPROVED', startDate: { lte: dateOnly(row.date) }, endDate: { gte: dateOnly(row.date) } } });
         if (leave) throw conflict('ON_LEAVE', 'Cannot import attendance during approved leave.');
         day = evaluateDay(toStaffDTO(staff), row.checkIn, row.checkOut, staff.isOvernightShift);
       } catch (e) {
@@ -486,13 +618,21 @@ export const importCSV = async ({ branchId: requested, rows }, actor) => {
       }
       await tx.attendanceRecord.create({
         data: {
-          branchId, staffId: staff.id, workDate: dateOnly(row.date), checkIn: row.checkIn, checkOut: row.checkOut || null, ...day,
-          status: row.checkOut ? 'PRESENT' : 'MISSING_PUNCH', source: 'IMPORT', isOvernightShift: staff.isOvernightShift,
+          tenantId: actor.tenantId,
+          branchId,
+          staffId: staff.id,
+          workDate: dateOnly(row.date),
+          checkIn: row.checkIn,
+          checkOut: row.checkOut || null,
+          ...day,
+          status: row.checkOut ? 'PRESENT' : 'MISSING_PUNCH',
+          source: 'IMPORT',
+          isOvernightShift: staff.isOvernightShift,
           rawEventRef: row.deviceId ? `DEV:${row.deviceId}|ROW:${row.rowNumber}` : null,
           punches: {
             create: [
-              { type: 'CHECK_IN', timestamp: row.checkIn, source: 'IMPORT', deviceId: row.deviceId || null },
-              ...(row.checkOut ? [{ type: 'CHECK_OUT', timestamp: row.checkOut, source: 'IMPORT', deviceId: row.deviceId || null }] : []),
+              { tenantId: actor.tenantId, type: 'CHECK_IN', timestamp: row.checkIn, source: 'IMPORT', deviceId: row.deviceId || null },
+              ...(row.checkOut ? [{ tenantId: actor.tenantId, type: 'CHECK_OUT', timestamp: row.checkOut, source: 'IMPORT', deviceId: row.deviceId || null }] : []),
             ],
           },
         },
@@ -508,38 +648,91 @@ export const importCSV = async ({ branchId: requested, rows }, actor) => {
 // ═══ LEAVES ═══════════════════════════════════════════════════════════════════
 
 export const listLeaves = async (actor, { branchId, staffId, date, startDate, endDate } = {}) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId, 'Access Denied: Cannot view leaves of another branch.');
+  }
+
   const sid = resolveStaffFilter(actor, staffId);
+  if (sid) {
+    const s = await prisma.staff.findUnique({ where: { id: sid } });
+    if (!s || s.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff record belongs to another salon company.');
+    }
+    if (actor.role === 'ADMIN' && s.branchId !== actor.branchId) {
+      throw forbidden('BRANCH_FORBIDDEN', 'Access Denied: Cannot view leaves of staff in another branch.');
+    }
+  }
+
   const b = actor.role === 'STAFF' ? null : resolveReadBranch(actor, branchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view leaves of another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+
   const rows = await prisma.leaveRecord.findMany({
-    where: { ...(b ? { branchId: b } : {}), ...(sid ? { staffId: sid } : {}),
+    where: {
+      tenantId: actor.tenantId,
+      ...(b ? { branchId: b } : {}),
+      ...(sid ? { staffId: sid } : {}),
       ...(date || endDate ? { startDate: { lte: dateOnly(date || endDate) } } : {}),
-      ...(date || startDate ? { endDate: { gte: dateOnly(date || startDate) } } : {}) }, orderBy: { startDate: 'desc' },
+      ...(date || startDate ? { endDate: { gte: dateOnly(date || startDate) } } : {}),
+    },
+    orderBy: { startDate: 'desc' },
   });
-  const staff = await staffMap(prisma, rows.map((r) => r.staffId));
+  const staff = await staffMap(prisma, rows.map((r) => r.staffId), actor.tenantId);
   return rows.map((l) => toLeaveDTO(l, staff.get(l.staffId)));
 };
 
-export const markLeave = async (input, actor) =>
-  prisma.$transaction(async (tx) => {
+export const markLeave = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  return prisma.$transaction(async (tx) => {
     const staff = await tx.staff.findUnique({ where: { id: input.staffId } });
     if (!staff || !staff.isActive) throw badRequest('STAFF_INVALID', `Staff member '${input.staffId}' is inactive or not found.`);
+    if (staff.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff member belongs to another salon company.');
+    }
+
     const branchId = resolveWriteBranch(actor, input.branchId || staff.branchId, 'Access Denied: Cannot mark leave for another branch.');
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
     if (staff.branchId !== branchId) throw badRequest('STAFF_BRANCH', `Staff member '${staff.name}' does not belong to this branch.`);
+
     await lockStaffPayBranch(tx, branchId);
     if (input.startDate > input.endDate) throw badRequest('INVALID_RANGE', 'Leave start date must be on or before end date.');
     await assertPayrollPeriodOpen(tx, staff.id, input.startDate, input.endDate);
-    const attended = await tx.attendanceRecord.findFirst({ where: { staffId: staff.id, workDate: { gte: dateOnly(input.startDate), lte: dateOnly(input.endDate) }, status: { in: ['PRESENT', 'LATE', 'MISSING_PUNCH'] } } });
+    const attended = await tx.attendanceRecord.findFirst({
+      where: {
+        tenantId: actor.tenantId,
+        staffId: staff.id,
+        workDate: { gte: dateOnly(input.startDate), lte: dateOnly(input.endDate) },
+        status: { in: ['PRESENT', 'LATE', 'MISSING_PUNCH'] },
+      },
+    });
     if (attended) throw conflict('LEAVE_ATTENDANCE_CONFLICT', 'This leave overlaps recorded attendance. Correct the attendance before marking leave.');
 
     const overlap = await tx.leaveRecord.findFirst({
-      where: { staffId: staff.id, status: 'APPROVED', startDate: { lte: dateOnly(input.endDate) }, endDate: { gte: dateOnly(input.startDate) } },
+      where: {
+        tenantId: actor.tenantId,
+        staffId: staff.id,
+        status: 'APPROVED',
+        startDate: { lte: dateOnly(input.endDate) },
+        endDate: { gte: dateOnly(input.startDate) },
+      },
     });
     if (overlap) {
       throw conflict('LEAVE_OVERLAP', `Conflicting leave (${overlap.leaveNumber}) already exists for ${staff.name} between ${ymd(overlap.startDate)} and ${ymd(overlap.endDate)}.`);
     }
 
     const dto = toStaffDTO(staff);
-    const holidays = await holidaysFor(tx, branchId);
+    const holidays = await holidaysFor(tx, branchId, actor.tenantId);
     const dates = [];
     for (let d = new Date(`${input.startDate}T00:00:00Z`); d <= new Date(`${input.endDate}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 1)) {
       const ds = d.toISOString().slice(0, 10);
@@ -548,7 +741,7 @@ export const markLeave = async (input, actor) =>
     if (!dates.length) throw badRequest('NO_WORKING_DAYS', 'Selected date range does not contain any scheduled working days.');
 
     if (input.type === 'PAID') {
-      const existingLeaves = await leavesForEngine(tx, staff.id);
+      const existingLeaves = await leavesForEngine(tx, staff.id, actor.tenantId);
       const periods = new Map();
       for (const date of dates) {
         const key = dto.leaveAllowancePeriod === 'YEARLY' ? date.slice(0, 4) : date.slice(0, 7);
@@ -563,12 +756,19 @@ export const markLeave = async (input, actor) =>
       }
     }
 
-    const branch = await tx.branch.findUnique({ where: { id: branchId } });
     const leave = await tx.leaveRecord.create({
       data: {
-        leaveNumber: await nextSequence(tx, branch.code, 'LV', Number(input.startDate.slice(0, 4))), branchId, staffId: staff.id,
-        startDate: dateOnly(input.startDate), endDate: dateOnly(input.endDate), totalDays: dates.length, type: input.type,
-        reason: input.reason, createdByUserId: actor.id, createdByName: actor.name,
+        tenantId: actor.tenantId,
+        leaveNumber: await nextSequence(tx, branch.code, 'LV', Number(input.startDate.slice(0, 4))),
+        branchId,
+        staffId: staff.id,
+        startDate: dateOnly(input.startDate),
+        endDate: dateOnly(input.endDate),
+        totalDays: dates.length,
+        type: input.type,
+        reason: input.reason,
+        createdByUserId: actor.id,
+        createdByName: actor.name,
       },
     });
     const status = input.type === 'PAID' ? 'PAID_LEAVE' : 'UNPAID_LEAVE';
@@ -576,25 +776,47 @@ export const markLeave = async (input, actor) =>
     for (const d of dates) {
       await tx.attendanceRecord.upsert({
         where: { staffId_workDate: { staffId: staff.id, workDate: dateOnly(d) } },
-        update: { status, workedHours: 0, leaveId: leave.id, notes: `Leave voucher: ${leave.leaveNumber} - ${input.reason}` },
+        update: {
+          tenantId: actor.tenantId,
+          status,
+          workedHours: 0,
+          leaveId: leave.id,
+          notes: `Leave voucher: ${leave.leaveNumber} - ${input.reason}`,
+        },
         create: {
-          branchId, staffId: staff.id, workDate: dateOnly(d), checkIn: 'LEAVE', checkOut: 'LEAVE', status, scheduledHours,
-          leaveId: leave.id, notes: `Leave voucher: ${leave.leaveNumber} - ${input.reason}`,
+          tenantId: actor.tenantId,
+          branchId,
+          staffId: staff.id,
+          workDate: dateOnly(d),
+          checkIn: 'LEAVE',
+          checkOut: 'LEAVE',
+          status,
+          scheduledHours,
+          leaveId: leave.id,
+          notes: `Leave voucher: ${leave.leaveNumber} - ${input.reason}`,
         },
       });
     }
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'LEAVE_MARKED', entity: 'LeaveRecord', entityId: leave.id, branchId, after: { days: dates.length, type: input.type } });
     return toLeaveDTO(leave, staff);
   });
+};
 
-export const cancelLeave = async (id, reason, actor) =>
-  prisma.$transaction(async (tx) => {
+export const cancelLeave = async (id, reason, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  return prisma.$transaction(async (tx) => {
     const header = await tx.leaveRecord.findUnique({ where: { id } });
     if (!header) throw notFound('LEAVE_NOT_FOUND', `Leave record '${id}' not found.`);
+    assertTenantAccess(actor, header);
+    assertBranchAccess(actor, header.branchId, 'Access Denied: Cannot cancel leave from another branch.');
+
     await lockStaffPayBranch(tx, header.branchId);
     const leave = await tx.leaveRecord.findUnique({ where: { id } });
     if (!leave) throw notFound('LEAVE_NOT_FOUND', `Leave record '${id}' not found.`);
+    assertTenantAccess(actor, leave);
     assertBranchAccess(actor, leave.branchId, 'Access Denied: Cannot cancel leave from another branch.');
+
     if (leave.status === 'CANCELLED') throw conflict('ALREADY_CANCELLED', `Leave '${leave.leaveNumber}' is already cancelled.`);
     await assertPayrollPeriodOpen(tx, leave.staffId, ymd(leave.startDate), ymd(leave.endDate));
     const updated = await tx.leaveRecord.update({
@@ -602,25 +824,72 @@ export const cancelLeave = async (id, reason, actor) =>
       data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledByUserId: actor.id, cancelledByName: actor.name, cancellationReason: reason },
     });
     // Remove only the synthetic leave days this voucher created.
-    await tx.attendanceRecord.deleteMany({ where: { leaveId: id, status: { in: LEAVE_STATUSES }, checkIn: 'LEAVE' } });
+    await tx.attendanceRecord.deleteMany({ where: { tenantId: actor.tenantId, leaveId: id, status: { in: LEAVE_STATUSES }, checkIn: 'LEAVE' } });
     // Leave may have replaced an existing absent row; restore absence rather than leaving paid leave behind.
-    await tx.attendanceRecord.updateMany({ where: { leaveId: id, status: { in: LEAVE_STATUSES } }, data: { status: 'ABSENT', workedHours: 0, leaveId: null } });
-    await tx.attendanceRecord.updateMany({ where: { leaveId: id }, data: { leaveId: null } });
+    await tx.attendanceRecord.updateMany({ where: { tenantId: actor.tenantId, leaveId: id, status: { in: LEAVE_STATUSES } }, data: { status: 'ABSENT', workedHours: 0, leaveId: null } });
+    await tx.attendanceRecord.updateMany({ where: { tenantId: actor.tenantId, leaveId: id }, data: { leaveId: null } });
     await auditLog(tx, { userId: actor.id, userName: actor.name, action: 'LEAVE_CANCELLED', entity: 'LeaveRecord', entityId: id, branchId: leave.branchId, after: { reason } });
     return toLeaveDTO(updated, await tx.staff.findUnique({ where: { id: leave.staffId } }));
   });
+};
 
 // ═══ HOLIDAYS ═════════════════════════════════════════════════════════════════
 
 export const listHolidays = async (actor, branchId) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId, 'Access Denied: Cannot view holidays of another branch.');
+  }
+
   const b = resolveReadBranch(actor, branchId);
-  const rows = await prisma.branchHoliday.findMany({ where: b ? { branchId: { in: ['ALL', b] } } : {}, orderBy: { date: 'asc' } });
+  if (b) {
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+
+  const rows = await prisma.branchHoliday.findMany({
+    where: {
+      tenantId: actor.tenantId,
+      ...(b ? { branchId: { in: ['ALL', b] } } : {}),
+    },
+    orderBy: { date: 'asc' },
+  });
   return rows.map(toHolidayDTO);
 };
 
 export const addHoliday = async ({ branchId, date, title }, actor) => {
-  const target = actor.role === 'SUPER_ADMIN' ? branchId || 'ALL' : resolveWriteBranch(actor, branchId);
-  const h = await prisma.branchHoliday.create({ data: { branchId: target, date: dateOnly(date), title } }).catch((e) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+
+  let target;
+  if (actor.role === 'SUPER_ADMIN') {
+    if (branchId && branchId !== 'ALL') {
+      const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+      if (!branch || branch.tenantId !== actor.tenantId) {
+        throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+      }
+      target = branchId;
+    } else {
+      target = 'ALL';
+    }
+  } else {
+    target = resolveWriteBranch(actor, branchId, 'Access Denied: Cannot add holiday for another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: target } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+
+  const h = await prisma.branchHoliday.create({
+    data: {
+      tenantId: actor.tenantId,
+      branchId: target,
+      date: dateOnly(date),
+      title,
+    },
+  }).catch((e) => {
     if (e.code === 'P2002') throw conflict('HOLIDAY_EXISTS', `A holiday is already configured on ${date}.`);
     throw e;
   });
@@ -630,11 +899,24 @@ export const addHoliday = async ({ branchId, date, title }, actor) => {
 // ═══ STAFF PORTAL ═════════════════════════════════════════════════════════════
 
 export const personalAttendance = async (actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (!actor.staffId) throw forbidden('FORBIDDEN', 'Staff record associated with the authenticated user could not be found.');
+
   const staff = await prisma.staff.findUnique({ where: { id: actor.staffId } });
-  const records = await prisma.attendanceRecord.findMany({ where: { staffId: staff.id }, include: recordInclude, orderBy: { workDate: 'desc' } });
-  const leaves = await prisma.leaveRecord.findMany({ where: { staffId: staff.id }, orderBy: { startDate: 'desc' } });
-  const allowance = evaluateLeaveAllowance(toStaffDTO(staff), await leavesForEngine(prisma, staff.id), await getBusinessDate());
+  if (!staff || staff.tenantId !== actor.tenantId) {
+    throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff record belongs to another salon company.');
+  }
+
+  const records = await prisma.attendanceRecord.findMany({
+    where: { tenantId: actor.tenantId, staffId: staff.id },
+    include: recordInclude,
+    orderBy: { workDate: 'desc' },
+  });
+  const leaves = await prisma.leaveRecord.findMany({
+    where: { tenantId: actor.tenantId, staffId: staff.id },
+    orderBy: { startDate: 'desc' },
+  });
+  const allowance = evaluateLeaveAllowance(toStaffDTO(staff), await leavesForEngine(prisma, staff.id, actor.tenantId), await getBusinessDate());
   return {
     records: records.map((r) => toAttendanceDTO(r, staff)),
     leaves: leaves.map((l) => toLeaveDTO(l, staff)),

@@ -9,7 +9,7 @@
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { dateOnly, getBusinessDate } from '../../lib/dates.js';
 import { round2, toDec } from '../../lib/money.js';
 import { nextSequence } from '../../lib/sequence.js';
@@ -54,8 +54,9 @@ export const ensureVault = async (tx, branchId) => {
  * With autoOpen (default) a new drawer is opened on the first cash transaction, like the mock.
  */
 export const getActiveDrawer = async (tx, actor, branchId, { autoOpen = true } = {}) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const drawers = await tx.cashDrawer.findMany({
-    where: { branchId, kind: 'DRAWER', custodianUserId: actor.id, status: { in: ['OPEN', 'SETTLEMENT_PENDING'] } },
+    where: { branchId, kind: 'DRAWER', custodianUserId: actor.id, status: { in: ['OPEN', 'SETTLEMENT_PENDING'] }, ...(actor.tenantId ? { tenantId: actor.tenantId } : {}) },
   });
   if (drawers.some((d) => d.status === 'SETTLEMENT_PENDING')) {
     throw conflict(
@@ -67,10 +68,11 @@ export const getActiveDrawer = async (tx, actor, branchId, { autoOpen = true } =
   if (!autoOpen) throw badRequest('NO_OPEN_DRAWER', 'You do not have an open cash drawer in this branch.');
 
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`drawer:${actor.id}:${branchId}`}::text))`;
-  const raced = await tx.cashDrawer.findFirst({ where: { branchId, kind: 'DRAWER', custodianUserId: actor.id, status: 'OPEN' } });
+  const raced = await tx.cashDrawer.findFirst({ where: { branchId, kind: 'DRAWER', custodianUserId: actor.id, status: 'OPEN', ...(actor.tenantId ? { tenantId: actor.tenantId } : {}) } });
   if (raced) return raced;
   return tx.cashDrawer.create({
     data: {
+      tenantId: actor.tenantId,
       kind: 'DRAWER', branchId, custodianUserId: actor.id, custodianName: actor.name,
       date: dateOnly(await getBusinessDate(tx)),
     },
@@ -88,7 +90,8 @@ export const postCashMovement = async (tx, m) => {
   const amount = round2(m.amount);
   if (amount.lessThanOrEqualTo(0)) throw badRequest('INVALID_AMOUNT', 'Cash movement amount must be positive.');
 
-  const holder = await lockHolder(tx, m.holderId);
+  const holder = await lockHolder(tx, m.holderId || m.drawerId);
+  assertTenantAccess(m.actor, holder, 'Access Denied: Cash drawer belongs to another salon company.');
   if (holder.status === 'SETTLED') throw conflict('DRAWER_CLOSED', 'This cash drawer has already been settled and closed.');
   if (holder.status === 'SETTLEMENT_PENDING' && !m.allowLocked) {
     throw conflict('DRAWER_LOCKED', 'This cash drawer is locked pending settlement review.');
@@ -107,6 +110,7 @@ export const postCashMovement = async (tx, m) => {
 
   return tx.drawerMovement.create({
     data: {
+      tenantId: m.actor.tenantId,
       drawerId: holder.id, branchId: holder.branchId, type: m.type, direction: m.direction, amount,
       ...(m.transactionDate ? { createdAt: new Date(m.transactionDate.toISOString().slice(0, 10) + "T12:00:00+05:00") } : {}),
       sourceModule: m.sourceModule, sourceId: m.sourceId ?? null, reference: m.reference ?? null,
@@ -127,7 +131,7 @@ export const postAccountMovement = async (tx, m) => {
 
   await tx.$executeRaw`SELECT 1 FROM "PaymentAccount" WHERE id = ${m.accountId} FOR UPDATE`;
   const account = await tx.paymentAccount.findUnique({ where: { id: m.accountId }, include: { branches: true } });
-  if (!account || (account.branchId !== m.branchId && !account.branches.some((b) => b.id === m.branchId)) || !account.isActive) {
+  if (!account || (account.branchId !== m.branchId && !account.branches.some((b) => b.id === m.branchId)) || !account.isActive || (m.actor?.tenantId && account.tenantId && account.tenantId !== m.actor.tenantId)) {
     throw badRequest('ACCOUNT_INVALID', `Payment account '${m.accountId}' is invalid or deactivated for this branch.`);
   }
   if (m.direction === 'OUT') {
@@ -141,6 +145,7 @@ export const postAccountMovement = async (tx, m) => {
   }
   const movement = await tx.accountMovement.create({
     data: {
+      tenantId: m.actor.tenantId,
       accountId: account.id, branchId: m.branchId, type: m.type, direction: m.direction, amount,
       ...(m.transactionDate ? { createdAt: new Date(m.transactionDate.toISOString().slice(0, 10) + "T12:00:00+05:00") } : {}),
       sourceModule: m.sourceModule, sourceId: m.sourceId ?? null, reference: m.reference ?? null,

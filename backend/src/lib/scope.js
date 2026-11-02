@@ -5,7 +5,17 @@ import { forbidden, badRequest } from './AppError.js';
 
 export const isSuperAdmin = (user) => user.role === 'SUPER_ADMIN';
 
+export const assertTenantAccess = (actor, entity, message = 'Access Denied: Cross-tenant access is forbidden.') => {
+  if (!actor?.tenantId) {
+    throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  }
+  if (!entity?.tenantId || entity.tenantId !== actor.tenantId) {
+    throw forbidden('FORBIDDEN_TENANT_ACCESS', message);
+  }
+};
+
 export const assertInvoiceAccess = (actor, invoice) => {
+  assertTenantAccess(actor, invoice);
   assertBranchAccess(actor, invoice.branchId);
   if (actor.role === 'SUPER_ADMIN' || actor.role === 'ADMIN') return;
   if (actor.role !== 'ACCOUNTANT' || !actor.id || invoice.processedByUserId !== actor.id) {

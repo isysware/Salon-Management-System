@@ -6,7 +6,14 @@ import prisma from '../config/prisma.js';
 import { AppError } from '../lib/AppError.js';
 import { asyncHandler } from '../lib/asyncHandler.js';
 
+export const markTenantRequired = (req, _res, next) => {
+  req.tenantRequired = true;
+  next();
+};
+
 export const tenantContext = asyncHandler(async (req, _res, next) => {
+  req.tenantRequired = true;
+
   if (!req.user) {
     throw new AppError(401, 'UNAUTHENTICATED', 'Authentication required for tenant context');
   }
@@ -14,29 +21,31 @@ export const tenantContext = asyncHandler(async (req, _res, next) => {
   const clientRequestedTenantId = req.headers['x-tenant-id'];
   let targetTenantId;
 
-  if (req.user.role === 'SUPER_ADMIN') {
-    // Platform Super Admin is authorized to inspect any tenant via header, or fallback to default
+  // Platform Admin bypass is ONLY permitted when explicitly authorized via platform middleware/flag
+  const isPlatformAdminBypass = Boolean(req.isPlatformAdmin && req.user.role === 'SUPER_ADMIN');
+
+  if (isPlatformAdminBypass) {
     targetTenantId = clientRequestedTenantId || req.user.tenantId || req.user.tenantMemberships?.[0]?.tenantId;
-    if (!targetTenantId) {
-      const defaultTenant = await prisma.tenant.findFirst({ where: { slug: 'flagship-salon' } });
-      targetTenantId = defaultTenant?.id;
-    }
   } else {
-    // Non-SuperAdmin: NEVER trust client-supplied X-Tenant-Id header unless user is a verified active member!
+    // Salon App (all users, including SUPER_ADMIN in salon operations):
+    // MUST have a verified, active TenantMembership for the target salon. Never trust client-supplied tenantId without active membership!
     const userMemberships = req.user.tenantMemberships || [];
-    const validTenantIds = userMemberships.filter(m => m.status === 'ACTIVE').map(m => m.tenantId);
+    const validTenantIds = userMemberships.filter((m) => m.status === 'ACTIVE').map((m) => m.tenantId);
 
     if (clientRequestedTenantId) {
       if (!validTenantIds.includes(clientRequestedTenantId)) {
         throw new AppError(
           403,
           'FORBIDDEN_TENANT_ACCESS',
-          'Access Denied: Cross-tenant access is forbidden. You are not a member of the requested salon.'
+          'Access Denied: Cross-tenant access is forbidden. You are not an active member of the requested salon.'
         );
       }
       targetTenantId = clientRequestedTenantId;
     } else {
-      targetTenantId = req.user.tenantId || validTenantIds[0];
+      // Default to user's assigned active tenant membership (never infer from foreign branch/default tenant)
+      targetTenantId = (req.user.tenantId && validTenantIds.includes(req.user.tenantId))
+        ? req.user.tenantId
+        : validTenantIds[0];
     }
   }
 
@@ -83,6 +92,8 @@ export const tenantContext = asyncHandler(async (req, _res, next) => {
 
   req.tenantId = tenant.id;
   req.tenantRole = activeMembership?.role || (req.user.role === 'SUPER_ADMIN' ? 'TENANT_OWNER' : 'STAFF');
+  req.user.tenantId = tenant.id;
+  req.user.tenantRole = req.tenantRole;
   req.tenant = {
     id: tenant.id,
     name: tenant.name,

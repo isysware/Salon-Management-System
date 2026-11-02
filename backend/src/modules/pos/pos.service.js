@@ -34,15 +34,22 @@ export const invoiceInclude = {
 const clockTime = () => formatMinutesToTime(parseTimeToMinutes(toTimeString(new Date())));
 const isWalkIn = (name) => !name || ['walk-in', 'walk-in customer'].includes(name.trim().toLowerCase());
 
-const loadInvoice = async (tx, id) => {
+const loadInvoice = async (tx, id, actor) => {
   const inv = await tx.invoice.findUnique({ where: { id }, include: invoiceInclude });
   if (!inv) throw notFound('INVOICE_NOT_FOUND', `Invoice '${id}' not found.`);
+  if (!actor?.tenantId) {
+    throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  }
+  if (!inv.tenantId || inv.tenantId !== actor.tenantId) {
+    throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Cross-tenant access is forbidden.');
+  }
   return inv;
 };
 
 // ═══ QUERIES ══════════════════════════════════════════════════════════════════
 
 export const listInvoices = async (actor, { branchId, status, date, startDate, endDate, clientId, soldByUserId, processedByUserId } = {}) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (actor.role === 'STAFF') throw forbidden('FORBIDDEN', 'Access Denied: Staff members cannot access invoices.');
   const b = resolveReadBranch(actor, branchId);
   const dateFilter = {};
@@ -53,6 +60,7 @@ export const listInvoices = async (actor, { branchId, status, date, startDate, e
   const userFilter = actor.role === 'ACCOUNTANT' ? actor.id : (soldByUserId || processedByUserId);
   const rows = await prisma.invoice.findMany({
     where: {
+      tenantId: actor.tenantId,
       ...(b ? { branchId: b } : {}),
       ...(status ? { status } : {}),
       ...(clientId ? { clientId } : {}),
@@ -66,19 +74,31 @@ export const listInvoices = async (actor, { branchId, status, date, startDate, e
 };
 
 export const getInvoice = async (actor, id) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const inv = await prisma.invoice.findUnique({ where: { id }, include: invoiceInclude });
   if (!inv) return null;
   if (actor.role === 'STAFF') throw forbidden('FORBIDDEN', 'Access Denied: Staff members cannot access invoices.');
+  if (!inv.tenantId || inv.tenantId !== actor.tenantId) {
+    throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Cross-tenant access is forbidden.');
+  }
   assertInvoiceAccess(actor, inv);
   return toInvoiceDTO(inv);
 };
 
 /** Open invoices of a client, matched by client id or by phone digits (walk-ins without a profile). */
 export const clientOutstanding = async (actor, { branchId, clientIdOrPhone }) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const b = resolveWriteBranch(actor, branchId);
   const digits = normalizePhoneDigits(clientIdOrPhone);
   const rows = await prisma.invoice.findMany({
-    where: { branchId: b, ...(actor.role === 'ACCOUNTANT' ? { processedByUserId: actor.id } : {}), status: { in: ['UNPAID', 'PARTIAL'] }, amountDue: { gt: 0 }, lifecycle: { not: 'VOIDED' } },
+    where: {
+      tenantId: actor.tenantId,
+      branchId: b,
+      ...(actor.role === 'ACCOUNTANT' ? { processedByUserId: actor.id } : {}),
+      status: { in: ['UNPAID', 'PARTIAL'] },
+      amountDue: { gt: 0 },
+      lifecycle: { not: 'VOIDED' },
+    },
     include: invoiceInclude,
     orderBy: [{ date: 'asc' }, { createdAt: 'asc' }],
   });
@@ -117,6 +137,10 @@ const validatePaymentShape = (p, { allowTip }) => {
  * tip = CASH_TIP). Online → named branch account. Returns the created InvoicePayment.
  */
 const receivePayment = async (tx, actor, { invoice, branchId, p, amounts, kind, date, time, previousBalance, notes }) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
+  if (!invoice.tenantId || invoice.tenantId !== actor.tenantId) {
+    throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Invoice belongs to another salon company.');
+  }
   let drawerId = null;
   let accountName = null;
   const billType = kind === 'DUES_COLLECTION' ? 'DUES_COLLECTION' : 'CASH_SALE';
@@ -130,6 +154,10 @@ const receivePayment = async (tx, actor, { invoice, branchId, p, amounts, kind, 
     if (amounts.tip.greaterThan(0)) await postCashMovement(tx, { ...common, holderId: drawer.id, type: 'CASH_TIP', direction: 'IN', amount: amounts.tip, description: `Tip on ${invoice.invoiceNumber} (staff liability)` });
   } else {
     if (!p.paymentAccountId) throw badRequest('ACCOUNT_REQUIRED', 'Online payment must reference a valid payment account.');
+    const accountCheck = await tx.paymentAccount.findUnique({ where: { id: p.paymentAccountId }, include: { branches: true } });
+    if (!accountCheck || !accountCheck.isActive || (accountCheck.branchId !== branchId && !accountCheck.branches.some((b) => b.id === branchId)) || (actor.tenantId && accountCheck.tenantId && accountCheck.tenantId !== actor.tenantId)) {
+      throw badRequest('ACCOUNT_INVALID', 'Payment account is invalid, inactive, or belongs to another salon company.');
+    }
     if (amounts.bill.greaterThan(0)) {
       const { account } = await postAccountMovement(tx, { ...common, accountId: p.paymentAccountId, branchId, type: billType, direction: 'IN', amount: amounts.bill, description: `${kind === 'DUES_COLLECTION' ? 'Dues collection' : 'POS sale'} ${invoice.invoiceNumber}` });
       accountName = account.name;
@@ -142,6 +170,7 @@ const receivePayment = async (tx, actor, { invoice, branchId, p, amounts, kind, 
 
   return tx.invoicePayment.create({
     data: {
+      tenantId: actor.tenantId,
       receiptNumber: await nextSequence(tx, '', 'RCP'),
       id: paymentId, invoiceId: invoice.id, branchId, date, time, amount: amounts.amount, billAmountAllocated: amounts.bill, tipAmountAllocated: amounts.tip,
       method: p.method, paymentAccountId: p.method === 'ONLINE_ACCOUNT' ? p.paymentAccountId : null, paymentAccountName: accountName, drawerId,
@@ -165,6 +194,7 @@ const resolveTaxRate = (treatment, specificRuleId, branch, rules) => {
 };
 
 export const postInvoice = async (input, actor, idempotencyKey, request) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (actor.role === 'STAFF') throw forbidden('FORBIDDEN', 'Access Denied: Staff members cannot perform POS billing or cash collections.');
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot perform operations for another branch.');
 
@@ -180,6 +210,9 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
       if (input.appointmentId) throw badRequest('MULTIPLE_RESERVATIONS', 'Choose either a booking or an appointment.');
       booking = await loadBooking(tx, actor, input.bookingId, { lock: true, editable: true });
       if (booking.branchId !== branchId) throw badRequest('BOOKING_BRANCH', 'Booking belongs to another branch.');
+      if (!booking.tenantId || booking.tenantId !== actor.tenantId) {
+        throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Booking belongs to another salon company.');
+      }
       if (booking.revision !== input.bookingRevision) throw conflict('BOOKING_OUTDATED', 'Booking changed. Refresh checkout.');
       if (input.bookingUpdate) booking = await reviseBooking(tx, booking, input.bookingUpdate, actor);
       advanceAdjusted = netPayments(booking.payments);
@@ -196,6 +229,9 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
       appointment = await tx.appointment.findUnique({ where: { id: input.appointmentId } });
       if (!appointment) throw notFound('APPOINTMENT_NOT_FOUND', `Linked appointment '${input.appointmentId}' not found.`);
       if (appointment.branchId !== branchId) throw badRequest('APPOINTMENT_BRANCH', `Appointment belongs to another branch, cannot bill under branch '${branch.name}'.`);
+      if (!appointment.tenantId || appointment.tenantId !== actor.tenantId) {
+        throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Appointment belongs to another salon company.');
+      }
       if (appointment.billingStatus === 'BILLED') {
         throw conflict('APPOINTMENT_BILLED', `Appointment '${appointment.appointmentNumber}' has already been billed under invoice ${appointment.linkedInvoiceNumber}. Duplicate invoices are prohibited.`);
       }
@@ -207,7 +243,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
     const [services, packages, products, staffRows, rules] = await Promise.all([
       tx.service.findMany({ where: { id: { in: ids('SERVICE') } } }),
       tx.package.findMany({ where: { id: { in: ids('PACKAGE') } }, include: { components: { include: { service: true } } } }),
-      tx.inventoryItem.findMany({ where: { id: { in: ids('PRODUCT') } } }),
+      tx.inventoryItem.findMany({ where: { id: { in: ids('PRODUCT') }, tenantId: actor.tenantId } }),
       tx.staff.findMany({ where: { branchId } }),
       tx.taxRule.findMany({ where: { OR: [{ branchId }, { branches: { some: { id: branchId } } }] } }),
     ]);
@@ -245,12 +281,12 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
         if (!catalogue || !catalogue.isActive || catalogue.branchId !== branchId) throw badRequest('ITEM_INVALID', `Service '${c.item.name}' is inactive or invalid for this branch.`);
       } else if (c.type === 'PACKAGE') {
         catalogue = packages.find((p) => p.id === c.item.id);
-        if (!catalogue || !catalogue.isActive || catalogue.branchId !== branchId) throw badRequest('ITEM_INVALID', `Package '${c.item.name}' is inactive or invalid for this branch.`);
+        if (!catalogue || !catalogue.isActive || catalogue.branchId !== branchId || (!catalogue.tenantId || catalogue.tenantId !== actor.tenantId)) throw badRequest('ITEM_INVALID', `Package '${c.item.name}' is inactive or invalid for this branch.`);
         const inactive = catalogue.components.find((k) => !k.service.isActive);
         if (inactive) throw badRequest('COMPONENT_INACTIVE', `Cannot sell package '${catalogue.name}': component service '${inactive.service.name}' is deactivated.`);
       } else {
         catalogue = products.find((p) => p.id === c.item.id);
-        if (!catalogue || !catalogue.isActive) throw badRequest('ITEM_INVALID', `Product '${c.item.name}' is inactive or invalid.`);
+        if (!catalogue || !catalogue.isActive || (catalogue.tenantId && catalogue.tenantId !== actor.tenantId)) throw badRequest('ITEM_INVALID', `Product '${c.item.name}' is inactive or invalid.`);
         if (!(catalogue.branchAvailability.includes('ALL') || catalogue.branchAvailability.includes(branchId))) {
           throw badRequest('ITEM_NOT_IN_BRANCH', `Product '${catalogue.name}' is not available for sale in this branch.`);
         }
@@ -327,6 +363,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
     const invoiceNumber = await nextSequence(tx, branch.code, 'INV', Number(today.slice(0, 4)));
     const invoice = await tx.invoice.create({
       data: {
+        tenantId: actor.tenantId,
         invoiceNumber, branchId, appointmentId: appointment?.id ?? null, date: dateOnly(today), time,
         clientId: client?.id ?? null, clientName, clientPhone,
         customerSource: input.customerSource || client?.source || 'WALK_IN', customerSourceDetails: input.customerSourceDetails || null,
@@ -349,6 +386,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
 
       const line = await tx.invoiceLine.create({
         data: {
+          tenantId: actor.tenantId,
           invoiceId: invoice.id, sortOrder: i, type: d.c.type, itemId: d.catalogue.id, code: d.c.type === 'PRODUCT' ? d.catalogue.sku : d.catalogue.code,
           name: d.catalogue.name, staffId: d.staff.id, staffName: lineStaffName, staffCommissionRate: commissionRate(d.staff),
           quantity: d.c.quantity, unitPrice: d.unitPrice, discountAllocated: d.discount, netSales: d.net,
@@ -361,6 +399,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
         if (rate.isZero() || attributedNet.lessThanOrEqualTo(0)) return null;
         return tx.commissionEvent.create({
           data: {
+            tenantId: actor.tenantId,
             branchId, staffId: staff.id, invoiceId: invoice.id, invoiceNumber, lineId: line.id, componentId: componentId ?? null,
             type: 'EARN', attributedNet, rate, amount: round2(attributedNet.times(rate).dividedBy(100)), eventDate: dateOnly(today),
           },
@@ -415,7 +454,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
           for (const [ci, k] of comps.entries()) {
             const assigned = d.c.packageComponents.find(pc => pc.serviceId === k.serviceId);
             const st = requireStaff(assigned?.staffId, k.service.name);
-            const comp = await tx.invoiceLineComponent.create({ data: { lineId: line.id, sortOrder: ci, serviceId: k.serviceId, serviceCode: k.service.code, serviceName: k.service.name,
+            const comp = await tx.invoiceLineComponent.create({ data: { tenantId: actor.tenantId, lineId: line.id, sortOrder: ci, serviceId: k.serviceId, serviceCode: k.service.code, serviceName: k.service.name,
               quantity: d.c.quantity, staffId: st.id, staffName: st.name, allocationPercentage: k.allocationPercentage, allocatedAmount: shares[ci], staffCommissionRate: commissionRate(st) } });
             await earn(st, shares[ci], comp.id);
           }
@@ -466,6 +505,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
           for (const [ci, k] of comps.entries()) {
             await tx.invoiceLineComponent.create({
               data: {
+                tenantId: actor.tenantId,
                 lineId: line.id, sortOrder: ci, serviceId: k.serviceId, serviceCode: k.service.code, serviceName: k.service.name,
                 quantity: k.quantity, staffId: assignedStaffList[0].id, staffName: assignedStaffList.map((s) => s.name).join(', '),
                 allocationPercentage: k.allocationPercentage,
@@ -482,6 +522,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
             const staff = assigned ? requireStaff(assigned.staffId, k.service.name) : d.staff;
             const comp = await tx.invoiceLineComponent.create({
               data: {
+                tenantId: actor.tenantId,
                 lineId: line.id, sortOrder: ci, serviceId: k.serviceId, serviceCode: k.service.code, serviceName: k.service.name,
                 quantity: k.quantity, staffId: staff.id, staffName: staff.name, allocationPercentage: k.allocationPercentage,
                 allocatedAmount: shares[ci], staffCommissionRate: commissionRate(staff),
@@ -501,7 +542,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
         let cogs = toDec(0);
         for (const m of movements) {
           const batch = await tx.inventoryBatch.findUnique({ where: { id: m.batchId } });
-          await tx.invoiceLineBatch.create({ data: { lineId: line.id, batchId: m.batchId, batchNumber: batch.batchNumber, qty: m.quantity, unitCost: m.unitCost } });
+          await tx.invoiceLineBatch.create({ data: { tenantId: actor.tenantId, lineId: line.id, batchId: m.batchId, batchNumber: batch.batchNumber, qty: m.quantity, unitCost: m.unitCost } });
           cogs = cogs.plus(m.totalCost);
         }
         await tx.invoiceLine.update({
@@ -521,6 +562,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
         const isHouse = !drafts[0].staff || drafts[0].staff.id === 'house' || drafts[0].staff.id === 'unassigned';
         await tx.tipReceipt.create({
           data: {
+            tenantId: actor.tenantId,
             receiptNumber: await nextSequence(tx, branch.code, 'TR'), branchId, invoiceId: invoice.id, invoiceNumber, paymentId: payment.id,
             collectionDate: dateOnly(today), collectionTime: time, clientName, method: p.method,
             paymentAccountId: payment.paymentAccountId, paymentAccountName: payment.paymentAccountName, cashDrawerId: payment.drawerId,
@@ -552,7 +594,7 @@ export const postInvoice = async (input, actor, idempotencyKey, request) => {
       userId: actor.id, userName: actor.name, action: 'INVOICE_POSTED', entity: 'Invoice', entityId: invoice.id, branchId,
       after: { invoiceNumber, netSales: netSales.toNumber(), tax: tax.toNumber(), tip: tip.toNumber(), total: total.toNumber(), status },
     });
-    return toInvoiceDTO(await loadInvoice(tx, invoice.id));
+    return toInvoiceDTO(await loadInvoice(tx, invoice.id, actor));
   });
 };
 
@@ -562,7 +604,7 @@ export const collectPayment = async (input, actor, request) => {
   if (actor.role === 'STAFF') throw forbidden('FORBIDDEN', 'Access Denied: Staff members cannot collect bill payments.');
   return paymentPosting(actor, request, async (tx) => {
     await tx.$executeRaw`SELECT 1 FROM "Invoice" WHERE id = ${input.invoiceId} FOR UPDATE`;
-    const invoice = await loadInvoice(tx, input.invoiceId);
+    const invoice = await loadInvoice(tx, input.invoiceId, actor);
     assertInvoiceAccess(actor, invoice);
     if (invoice.lifecycle === 'VOIDED') throw conflict('INVOICE_VOIDED', `Invoice '${invoice.invoiceNumber}' has been voided.`);
     if (invoice.status === 'PAID' || toDec(invoice.amountDue).lessThanOrEqualTo(0)) {
@@ -608,7 +650,7 @@ export const collectPayment = async (input, actor, request) => {
 
 export const reverseCollection = (input, actor, request) => paymentPosting(actor, request, async (tx) => {
   await tx.$executeRaw`SELECT 1 FROM "Invoice" WHERE id = ${input.invoiceId} FOR UPDATE`;
-  const invoice = await loadInvoice(tx, input.invoiceId);
+  const invoice = await loadInvoice(tx, input.invoiceId, actor);
   assertInvoiceAccess(actor, invoice);
   const payment = invoice.payments.find((p) => p.id === input.paymentId);
   if (!payment || payment.kind !== 'DUES_COLLECTION') throw badRequest('INVALID_COLLECTION', 'Only outstanding invoice collections can be reversed here.');

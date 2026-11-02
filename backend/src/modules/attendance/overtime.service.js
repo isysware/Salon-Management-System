@@ -6,7 +6,7 @@
 import prisma from '../../config/prisma.js';
 import { auditLog } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, notFound } from '../../lib/AppError.js';
-import { assertBranchAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
+import { assertBranchAccess, assertTenantAccess, resolveReadBranch, resolveWriteBranch } from '../../lib/scope.js';
 import { dateOnly, ymd } from '../../lib/dates.js';
 import { round2, toDec } from '../../lib/money.js';
 import { nextSequence } from '../../lib/sequence.js';
@@ -24,8 +24,13 @@ export const toOvertimeDTO = (o, staff) => ({
   cancelledAt: iso(o.cancelledAt), cancellationReason: opt(o.cancellationReason), payrollId: opt(o.payrollRunId), rateMultiplier: num(o.rateMultiplier),
 });
 
-const withStaff = async (rows) => {
-  const staff = await prisma.staff.findMany({ where: { id: { in: [...new Set(rows.map((r) => r.staffId))] } } });
+const withStaff = async (rows, tenantId) => {
+  const staff = await prisma.staff.findMany({
+    where: {
+      id: { in: [...new Set(rows.map((r) => r.staffId))] },
+      ...(tenantId ? { tenantId } : {}),
+    },
+  });
   const map = new Map(staff.map((s) => [s.id, s]));
   return rows.map((r) => toOvertimeDTO(r, map.get(r.staffId)));
 };
@@ -33,29 +38,65 @@ const withStaff = async (rows) => {
 const estimate = (minutes, rate) => round2(toDec(minutes).dividedBy(60).times(rate));
 
 export const listOvertime = async (actor, { branchId, staffId, date, startDate, endDate } = {}) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (actor.role === 'ACCOUNTANT') throw forbidden('FORBIDDEN', 'Access Denied: Accountants do not have permission to view overtime.');
+
+  if (branchId && branchId !== 'ALL') {
+    assertBranchAccess(actor, branchId, 'Access Denied: Cannot view overtime of another branch.');
+  }
+
   let sid = staffId;
   if (actor.role === 'STAFF') {
     if (!actor.staffId) throw forbidden('FORBIDDEN', 'Staff record associated with the authenticated user could not be found.');
     if (staffId && staffId !== actor.staffId) throw forbidden('FORBIDDEN', 'Access Denied: Staff members can only view their own overtime records.');
     sid = actor.staffId;
   }
+
+  if (sid) {
+    const s = await prisma.staff.findUnique({ where: { id: sid } });
+    if (!s || s.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff record belongs to another salon company.');
+    }
+    if (actor.role === 'ADMIN' && s.branchId !== actor.branchId) {
+      throw forbidden('BRANCH_FORBIDDEN', 'Access Denied: Cannot view overtime of staff in another branch.');
+    }
+  }
+
   const b = actor.role === 'STAFF' ? null : resolveReadBranch(actor, branchId);
+  if (b) {
+    assertBranchAccess(actor, b, 'Access Denied: Cannot view overtime of another branch.');
+    const branch = await prisma.branch.findUnique({ where: { id: b } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+  }
+
   const rows = await prisma.overtimeRecord.findMany({
-    where: { ...(b ? { branchId: b } : {}), ...(sid ? { staffId: sid } : {}), ...(actor.role === 'STAFF' ? { status: 'APPROVED' } : {}),
-      ...(date || startDate || endDate ? { workDate: { ...(date ? { equals: dateOnly(date) } : {}), ...(startDate ? { gte: dateOnly(startDate) } : {}), ...(endDate ? { lte: dateOnly(endDate) } : {}) } } : {}) },
+    where: {
+      tenantId: actor.tenantId,
+      ...(b ? { branchId: b } : {}),
+      ...(sid ? { staffId: sid } : {}),
+      ...(actor.role === 'STAFF' ? { status: 'APPROVED' } : {}),
+      ...(date || startDate || endDate ? { workDate: { ...(date ? { equals: dateOnly(date) } : {}), ...(startDate ? { gte: dateOnly(startDate) } : {}), ...(endDate ? { lte: dateOnly(endDate) } : {}) } } : {}),
+    },
     orderBy: [{ workDate: 'desc' }, { enteredAt: 'desc' }],
   });
-  return withStaff(rows);
+  return withStaff(rows, actor.tenantId);
 };
 
 const load = async (tx, actor, id, verb) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const header = await tx.overtimeRecord.findUnique({ where: { id } });
   if (!header) throw notFound('OVERTIME_NOT_FOUND', `Overtime record '${id}' not found.`);
+  assertTenantAccess(actor, header);
+  assertBranchAccess(actor, header.branchId, `Access Denied: Cannot ${verb} overtime from another branch.`);
+
   await lockStaffPayBranch(tx, header.branchId);
   const o = await tx.overtimeRecord.findUnique({ where: { id } });
   if (!o) throw notFound('OVERTIME_NOT_FOUND', `Overtime record '${id}' not found.`);
+  assertTenantAccess(actor, o);
   assertBranchAccess(actor, o.branchId, `Access Denied: Cannot ${verb} overtime from another branch.`);
+
   if (o.payrollRunId) throw conflict('OVERTIME_LOCKED', `Cannot ${verb} overtime already linked to finalized payroll.`);
   await assertPayrollPeriodOpen(tx, o.staffId, ymd(o.workDate));
   return o;
@@ -67,25 +108,46 @@ const finish = async (tx, actor, action, o) => {
 };
 
 export const createOvertime = async (input, actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   const branchId = resolveWriteBranch(actor, input.branchId, 'Access Denied: Cannot enter overtime for another branch.');
+
   return prisma.$transaction(async (tx) => {
+    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+    if (!branch || branch.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Branch belongs to another salon company.');
+    }
+
     await lockStaffPayBranch(tx, branchId);
     const staff = await tx.staff.findUnique({ where: { id: input.staffId } });
-    if (!staff || !staff.isActive || staff.branchId !== branchId) throw badRequest('STAFF_INVALID', `Staff member '${input.staffId}' is inactive or not found in this branch.`);
+    if (!staff || !staff.isActive) throw badRequest('STAFF_INVALID', `Staff member '${input.staffId}' is inactive or not found.`);
+    if (staff.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff member belongs to another salon company.');
+    }
+    if (staff.branchId !== branchId) throw badRequest('STAFF_BRANCH', `Staff member '${staff.name}' does not belong to this branch.`);
+
     await assertPayrollPeriodOpen(tx, staff.id, input.date);
     const dup = await tx.overtimeRecord.findFirst({
-      where: { staffId: staff.id, workDate: dateOnly(input.date), status: { notIn: ['CANCELLED', 'REJECTED'] } },
+      where: { tenantId: actor.tenantId, staffId: staff.id, workDate: dateOnly(input.date), status: { notIn: ['CANCELLED', 'REJECTED'] } },
     });
     if (dup && !input.notes?.includes('INTENTIONAL_ADDITIONAL')) {
       throw conflict('OVERTIME_EXISTS', `An active overtime record already exists for ${staff.name} on ${input.date}. Please edit the existing record or specify notes for intentional additional overtime.`);
     }
-    const branch = await tx.branch.findUnique({ where: { id: branchId } });
+
     const o = await tx.overtimeRecord.create({
       data: {
-        overtimeNumber: await nextSequence(tx, branch.code, 'OT', Number(input.date.slice(0, 4))), branchId, staffId: staff.id,
-        workDate: dateOnly(input.date), minutes: input.minutes, reason: input.reason, notes: input.notes || null,
-        status: input.status || 'DRAFT', hourlyRate: staff.overtimeHourlyRate, amount: estimate(input.minutes, staff.overtimeHourlyRate),
-        enteredByUserId: actor.id, enteredByName: actor.name,
+        tenantId: actor.tenantId,
+        overtimeNumber: await nextSequence(tx, branch.code, 'OT', Number(input.date.slice(0, 4))),
+        branchId,
+        staffId: staff.id,
+        workDate: dateOnly(input.date),
+        minutes: input.minutes,
+        reason: input.reason,
+        notes: input.notes || null,
+        status: input.status || 'DRAFT',
+        hourlyRate: staff.overtimeHourlyRate,
+        amount: estimate(input.minutes, staff.overtimeHourlyRate),
+        enteredByUserId: actor.id,
+        enteredByName: actor.name,
       },
     });
     return finish(tx, actor, 'OVERTIME_ENTERED', o);
@@ -111,6 +173,9 @@ export const approveOvertime = async (id, actor) =>
     if (o.status === 'APPROVED') throw conflict('ALREADY_APPROVED', `Overtime record '${o.overtimeNumber}' is already approved.`);
     if (['CANCELLED', 'REJECTED'].includes(o.status)) throw conflict('OVERTIME_CLOSED', `Cannot approve ${o.status.toLowerCase()} overtime.`);
     const staff = await tx.staff.findUnique({ where: { id: o.staffId } });
+    if (!staff || staff.tenantId !== actor.tenantId) {
+      throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff member belongs to another salon company.');
+    }
     const rate = toDec(staff.overtimeHourlyRate).times(o.rateMultiplier);
     const updated = await tx.overtimeRecord.update({
       where: { id },
@@ -145,9 +210,19 @@ export const cancelOvertime = async (id, reason, actor) =>
   });
 
 export const personalOvertime = async (actor) => {
+  if (!actor?.tenantId) throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required.');
   if (!actor.staffId) throw forbidden('FORBIDDEN', 'Staff record associated with the authenticated user could not be found.');
-  const rows = await prisma.overtimeRecord.findMany({ where: { staffId: actor.staffId }, orderBy: { workDate: 'desc' } });
-  const records = await withStaff(rows);
+
+  const staff = await prisma.staff.findUnique({ where: { id: actor.staffId } });
+  if (!staff || staff.tenantId !== actor.tenantId) {
+    throw forbidden('FORBIDDEN_TENANT_ACCESS', 'Access Denied: Staff record belongs to another salon company.');
+  }
+
+  const rows = await prisma.overtimeRecord.findMany({
+    where: { tenantId: actor.tenantId, staffId: actor.staffId },
+    orderBy: { workDate: 'desc' },
+  });
+  const records = await withStaff(rows, actor.tenantId);
   const approved = records.filter((r) => r.status === 'APPROVED');
   return {
     records,

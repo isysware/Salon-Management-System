@@ -1,5 +1,5 @@
 import prisma from '../config/prisma.js';
-import { conflict } from './AppError.js';
+import { conflict, forbidden } from './AppError.js';
 import { createHash } from 'node:crypto';
 
 export const paymentRequestHash = (body) => {
@@ -11,8 +11,11 @@ export const paymentRequestHash = (body) => {
 // The saved response and all financial writes share one transaction. The advisory lock
 // serializes concurrent retries, including requests arriving before the first commit.
 export const paymentPosting = (actor, request, work) => prisma.$transaction(async (tx) => {
+  if (!actor?.tenantId) {
+    throw forbidden('TENANT_REQUIRED', 'Access Denied: Verified tenant context is required for payment operations.');
+  }
   if (!request) return work(tx);
-  const key = `${actor.id}:${request.key}`;
+  const key = `${actor.tenantId}:${actor.id}:${request.key}`;
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${key}::text))`;
   const saved = await tx.idempotencyKey.findUnique({ where: { key } });
   if (saved) {

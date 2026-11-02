@@ -4,6 +4,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { authenticate } from '../../middleware/authenticate.js';
 import { authorize } from '../../middleware/authorize.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { validate } from '../../middleware/validate.js';
 import { idempotency } from '../../middleware/idempotency.js';
 import { asyncHandler } from '../../lib/asyncHandler.js';
@@ -18,9 +19,9 @@ const filters = z.object({
 const send = (fn, status = 200) => asyncHandler(async (req, res) => res.status(status).json({ data: await fn(req) }));
 
 const router = Router();
-router.get('/me', authenticate, authorize('STAFF'), send((req) => s.personalTips(req.user)));
+router.get('/me', authenticate, tenantContext, authorize('STAFF'), send((req) => s.personalTips(req.user)));
 
-router.use(authenticate, authorize('SUPER_ADMIN', 'ADMIN'));
+router.use(authenticate, tenantContext, authorize('SUPER_ADMIN', 'ADMIN'));
 router.get('/receipts',    validate(filters, 'query'), send((req) => s.listReceipts(req.user, req.query)));
 router.get('/allocations', validate(filters, 'query'), send((req) => s.listAllocations(req.user, req.query)));
 router.get('/payouts',     validate(filters, 'query'), send((req) => s.listPayouts(req.user, req.query)));

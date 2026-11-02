@@ -2,6 +2,7 @@
 
 import { Router } from 'express';
 import { authenticate } from '../../middleware/authenticate.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { authorize } from '../../middleware/authorize.js';
 import { validate } from '../../middleware/validate.js';
 import { idempotency } from '../../middleware/idempotency.js';
@@ -17,12 +18,12 @@ const send = (fn, status = 200) => asyncHandler(async (req, res) => res.status(s
 
 // ── /pos ─────────────────────────────────────────────────────────────────────
 export const posRoutes = Router();
-posRoutes.use(authenticate, authorize(...CASH_HANDLERS));
+posRoutes.use(authenticate, tenantContext, authorize(...CASH_HANDLERS));
 posRoutes.post('/invoices/checkout', idempotency, validate(v.checkoutSchema), send((req) => pos.postInvoice(req.body, req.user, req.idempotencyKey, postingRequest(req)), 201));
 
 // ── /invoices ────────────────────────────────────────────────────────────────
 export const invoiceRoutes = Router();
-invoiceRoutes.use(authenticate, authorize(...CASH_HANDLERS));
+invoiceRoutes.use(authenticate, tenantContext, authorize(...CASH_HANDLERS));
 invoiceRoutes.get('/',            validate(v.listQuery, 'query'), send((req) => pos.listInvoices(req.user, req.query)));
 invoiceRoutes.get('/outstanding', validate(v.outstandingQuery, 'query'), send((req) => pos.clientOutstanding(req.user, req.query)));
 invoiceRoutes.get('/:id', send(async (req) => {

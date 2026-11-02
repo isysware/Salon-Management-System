@@ -5,6 +5,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { authenticate } from '../../middleware/authenticate.js';
+import { tenantContext } from '../../middleware/tenantContext.js';
 import { authorize } from '../../middleware/authorize.js';
 import { validate } from '../../middleware/validate.js';
 import { asyncHandler } from '../../lib/asyncHandler.js';
@@ -71,7 +72,7 @@ const bulkSaveSchema = z.object({
 
 // ── /attendance ──────────────────────────────────────────────────────────────
 export const attendanceRoutes = Router();
-attendanceRoutes.use(authenticate);
+attendanceRoutes.use(authenticate, tenantContext);
 attendanceRoutes.get('/',               authorize(...READERS, 'ACCOUNTANT'), validate(listQuery, 'query'), send((req) => a.listAttendance(req.user, req.query)));
 attendanceRoutes.get('/me',             authorize('STAFF'), send((req) => a.personalAttendance(req.user)));
 attendanceRoutes.post('/',              authorize(...ADMINS), validate(createSchema), send((req) => a.createAttendance(req.body, req.user), 201));
@@ -83,20 +84,20 @@ attendanceRoutes.post('/import-csv',    authorize(...ADMINS), validate(importSch
 
 // ── /leaves ──────────────────────────────────────────────────────────────────
 export const leaveRoutes = Router();
-leaveRoutes.use(authenticate);
+leaveRoutes.use(authenticate, tenantContext);
 leaveRoutes.get('/',            authorize(...READERS, 'ACCOUNTANT'), validate(listQuery, 'query'), send((req) => a.listLeaves(req.user, req.query)));
 leaveRoutes.post('/',           authorize(...ADMINS), validate(leaveSchema), send((req) => a.markLeave(req.body, req.user), 201));
 leaveRoutes.post('/:id/cancel', authorize(...ADMINS), validate(cancelSchema), send((req) => a.cancelLeave(req.params.id, req.body.reason, req.user)));
 
 // ── /holidays ────────────────────────────────────────────────────────────────
 export const holidayRoutes = Router();
-holidayRoutes.use(authenticate);
+holidayRoutes.use(authenticate, tenantContext);
 holidayRoutes.get('/',  send((req) => a.listHolidays(req.user, req.query.branchId)));
 holidayRoutes.post('/', authorize(...ADMINS), validate(holidaySchema), send((req) => a.addHoliday(req.body, req.user), 201));
 
 // ── /overtime ────────────────────────────────────────────────────────────────
 export const overtimeRoutes = Router();
-overtimeRoutes.use(authenticate);
+overtimeRoutes.use(authenticate, tenantContext);
 overtimeRoutes.get('/',             authorize(...READERS, 'ACCOUNTANT'), validate(listQuery, 'query'), send((req) => ot.listOvertime(req.user, req.query)));
 overtimeRoutes.get('/me',           authorize('STAFF'), send((req) => ot.personalOvertime(req.user)));
 overtimeRoutes.post('/',            authorize(...ADMINS), validate(otCreate), send((req) => ot.createOvertime(req.body, req.user), 201));

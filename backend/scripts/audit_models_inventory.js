@@ -2,7 +2,7 @@ import prisma from '../src/config/prisma.js';
 
 async function main() {
   const models = Object.keys(prisma).filter(k => !k.startsWith('$') && !k.startsWith('_'));
-  
+
   // Get all tenants in DB
   const tenants = await prisma.tenant.findMany({ select: { id: true, name: true, slug: true } });
   console.log('--- REGISTERED TENANTS IN DB ---');
@@ -16,7 +16,7 @@ async function main() {
 
     try {
       const total = await delegate.count();
-      
+
       // Check if model has tenantId field by attempting query with where: { tenantId: null }
       let hasTenantId = false;
       let nullTenantCount = 0;
